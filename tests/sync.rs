@@ -39,7 +39,10 @@ impl Server {
     }
 
     fn request(&self, method: Method, path: &str, device: Option<&str>) -> reqwest::RequestBuilder {
-        let mut req = self.client.request(method, format!("{}{path}", self.base));
+        let mut req = self
+            .client
+            .request(method, format!("{}{path}", self.base))
+            .header("X-KwikPaste-Client", "KwikPaste/2.0.11 (windows)");
         if let Some(token) = self.server_token {
             req = req.header("X-KwikPaste-Server-Token", token);
         }
@@ -454,6 +457,12 @@ async fn official_policy() {
 
     let (status, info) = s.call(Method::GET, "/v1/info", None, None).await;
     assert_eq!(status, StatusCode::OK, "no server token needed");
+    let (status, _) = s.call(Method::GET, "/v1/stats", None, None).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "no stats without a stats token"
+    );
     assert_eq!(info["mode"], "official");
     assert_eq!(info["policy"]["images"], "live");
     assert_eq!(
@@ -595,6 +604,87 @@ async fn shutdown_closes_open_streams() {
     events.assert_ended().await;
     let result = timeout(Duration::from_secs(5), server).await;
     assert!(matches!(result, Ok(Ok(Ok(())))), "server did not stop");
+}
+
+const STATS_TOKEN: &str = "stats-token-stats-token-stats-token";
+
+#[tokio::test]
+async fn official_stats() {
+    let s = Server::start(|dir| {
+        let mut config = Config::official(dir);
+        config.stats_token = Some(STATS_TOKEN.into());
+        config
+    })
+    .await;
+    let stats = || async {
+        let resp = s
+            .client
+            .get(format!("{}/v1/stats?days=7", s.base))
+            .header("X-KwikPaste-Stats-Token", STATS_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        resp.json::<Value>().await.unwrap()
+    };
+    let (status, _) = s.call(Method::GET, "/v1/stats", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let ta = s.create_group(A).await;
+    let mut ea = s.events(&ta, "after=0").await;
+    ea.next().await;
+    let tb = s.pair(&ta, &mut ea, B).await;
+    let mut eb = s.events(&tb, "after=0").await;
+    eb.next().await;
+    let image = (entry(2, "item", "image", 2, A), vec![9; 500]);
+    let results = s.upload(&ta, &[text_frame(1, 1, b"hello"), image]).await;
+    assert_eq!(results[1]["status"], "forwarded");
+    eb.next_skipping_devices().await;
+    eb.next_skipping_devices().await;
+
+    let report = stats().await;
+    assert_eq!(report["online"]["devices"], 2);
+    assert_eq!(report["totals"]["devices"], 2);
+    assert_eq!(report["groupSizes"], json!([{ "devices": 2, "groups": 1 }]));
+    assert_eq!(
+        report["clients"],
+        json!([{ "version": "2.0.11", "platform": "windows", "devices": 2 }])
+    );
+    let days = report["days"].as_array().unwrap();
+    assert_eq!(days.len(), 7);
+    let today = &days[6]["metrics"];
+    for (metric, value) in [
+        ("groups.created", 1),
+        ("devices.joined", 1),
+        ("pair.codes", 1),
+        ("pair.ok", 1),
+        ("up.text.n", 1),
+        ("up.text.bytes", 5),
+        ("live.text.n", 1),
+        ("up.image.n", 1),
+        ("live.image.bytes", 500),
+        ("active.devices", 2),
+        ("active.groups", 1),
+        ("total.devices", 2),
+    ] {
+        assert_eq!(today[metric], value, "{metric}");
+    }
+    let minutes = &report["minutes"];
+    let sum = |column: &str| -> i64 {
+        minutes[column]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_i64().unwrap())
+            .sum()
+    };
+    assert_eq!(minutes["uploads"].as_array().unwrap().len(), 24 * 60);
+    assert_eq!(sum("uploads"), 2);
+    assert!(sum("bytesOut") > 500 && sum("peakOut") > 500);
+
+    // Reporting again flushes nothing new and counts nothing twice.
+    let again = stats().await;
+    assert_eq!(again["days"][6]["metrics"]["up.text.n"], 1);
 }
 
 fn text_frame(id: u32, clock: u64, body: &[u8]) -> (Value, Vec<u8>) {

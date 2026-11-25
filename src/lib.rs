@@ -11,12 +11,13 @@ mod hub;
 mod limits;
 mod pairing;
 mod routes;
+mod stats;
 mod stream;
 mod upload;
 
 use anyhow::Context;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use chrono::{SecondsFormat, TimeDelta, Utc};
+use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use rand::RngCore;
 use sqlx::SqlitePool;
 use std::{
@@ -44,6 +45,8 @@ pub struct App {
     store_lock: tokio::sync::Mutex<()>,
     /// Stored bytes over all groups; changed under `store_lock`, recounted on every purge.
     stored: AtomicU64,
+    stats: stats::Stats,
+    started_at: DateTime<Utc>,
 }
 
 pub type AppState = Arc<App>;
@@ -59,6 +62,8 @@ pub async fn serve(
     let stored = AtomicU64::new(db::total_bytes(&db).await?);
     let app = Arc::new(App {
         limits: limits::Limits::new(config.limits.clone()),
+        stats: stats::Stats::new(config.stats_token.is_some()),
+        started_at: Utc::now(),
         config,
         db,
         blobs,
@@ -69,6 +74,10 @@ pub async fn serve(
     });
 
     let purger = tokio::spawn(purge_loop(app.clone()));
+    let stats = app
+        .stats
+        .enabled()
+        .then(|| tokio::spawn(stats::flush_loop(app.clone())));
     let router = routes::router(app.clone());
     let closing = app.clone();
     let result = axum::serve(
@@ -82,6 +91,12 @@ pub async fn serve(
     })
     .await;
     purger.abort();
+    if let Some(stats) = stats {
+        stats.abort();
+    }
+    if let Err(err) = stats::flush(&app).await {
+        tracing::warn!("stats flush failed: {err:#}");
+    }
     app.db.close().await;
     Ok(result?)
 }
@@ -113,6 +128,7 @@ async fn purge(app: &App) -> anyhow::Result<()> {
             let blobs = db::delete_group(&app.db, &group).await?;
             app.blobs.remove(blobs).await;
             app.pairing.forget_group(&group);
+            app.stats.add("groups.idle", 1);
             tracing::info!("deleted idle group {group}");
         }
     }
@@ -131,6 +147,9 @@ async fn purge(app: &App) -> anyhow::Result<()> {
 
     app.pairing.purge();
     app.limits.purge();
+    if app.stats.enabled() {
+        stats::purge(&app.db).await?;
+    }
     Ok(())
 }
 

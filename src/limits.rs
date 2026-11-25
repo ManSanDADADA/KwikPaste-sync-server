@@ -141,6 +141,13 @@ impl Limits {
         Ok(())
     }
 
+    /// Image bytes forwarded today over all groups.
+    pub fn images_today(&self) -> u64 {
+        let mut state = self.lock();
+        state.roll_day();
+        state.global_images
+    }
+
     pub fn charge_image(&self, group: &str, len: u64) {
         if self.config.image_quota.is_none() {
             return;

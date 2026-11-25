@@ -3,14 +3,15 @@
 use crate::{
     db::{self, Removed},
     error::ApiError,
-    extract::{ApiJson, ClientIp, Member},
+    extract::{ApiJson, ApiQuery, ClientIp, Member},
     frames,
     hub::devices_frame,
     limits::Bucket,
-    now, pairing, random_token, stream, timestamp, token_hash, upload, AppState,
+    now, pairing, random_token, stats, stream, timestamp, token_hash, upload, App, AppState,
 };
 use axum::{
     extract::{Path, Request, State},
+    http::HeaderMap,
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
@@ -18,7 +19,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::{net::IpAddr, time::Duration};
 use subtle::ConstantTimeEq;
 
 /// How long `POST /v1/join` waits for the inviter's reply.
@@ -38,11 +39,13 @@ pub fn router(app: AppState) -> Router {
         .route("/v1/devices/{device}", delete(remove_device))
         .route("/v1/entries", post(upload::upload))
         .route("/v1/events", get(stream::events))
+        .route("/v1/stats", get(stats_report))
         .fallback(|| async { ApiError::NotFound })
         .layer(middleware::from_fn_with_state(
             app.clone(),
             require_server_token,
         ))
+        .layer(middleware::from_fn_with_state(app.clone(), count_responses))
         .with_state(app)
 }
 
@@ -59,6 +62,43 @@ async fn require_server_token(State(app): State<AppState>, req: Request, next: N
         }
     }
     next.run(req).await
+}
+
+/// Counts requests and their 4xx / 5xx answers for the statistics.
+async fn count_responses(State(app): State<AppState>, req: Request, next: Next) -> Response {
+    let response = next.run(req).await;
+    let status = response.status();
+    app.stats.add("http.requests", 1);
+    if status.is_server_error() {
+        app.stats.add("http.5xx", 1);
+    } else if status.is_client_error() {
+        app.stats.add("http.4xx", 1);
+    }
+    response
+}
+
+#[derive(Deserialize)]
+struct StatsQuery {
+    days: Option<u32>,
+}
+
+/// Aggregate statistics for the operator; only exists while `KP_SYNC_STATS_TOKEN` is set.
+async fn stats_report(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    ApiQuery(query): ApiQuery<StatsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(expected) = &app.config.stats_token else {
+        return Err(ApiError::NotFound);
+    };
+    let given = headers
+        .get("x-kwikpaste-stats-token")
+        .map(|v| v.as_bytes())
+        .unwrap_or_default();
+    if !bool::from(given.ct_eq(expected.as_bytes())) {
+        return Err(ApiError::Unauthorized);
+    }
+    Ok(Json(stats::report(&app, query.days.unwrap_or(30)).await?))
 }
 
 fn done() -> Json<Value> {
@@ -103,7 +143,9 @@ async fn create_group(
     ClientIp(ip): ClientIp,
     ApiJson(req): ApiJson<NewGroup>,
 ) -> Result<Json<Value>, ApiError> {
-    app.limits.hit(Bucket::Groups, ip)?;
+    app.limits
+        .hit(Bucket::Groups, ip)
+        .inspect_err(|_| app.stats.add("limit.groupsPerIp", 1))?;
     check_device_id(&req.device_id)?;
     check_device_info(&req.info)?;
     let group = uuid::Uuid::new_v4().to_string();
@@ -117,12 +159,14 @@ async fn create_group(
         &now(),
     )
     .await?;
+    app.stats.add("groups.created", 1);
     tracing::info!("group {group} created");
     Ok(Json(json!({ "groupId": group, "deviceToken": token })))
 }
 
 async fn create_code(State(app): State<AppState>, member: Member) -> Json<Value> {
     let (code, expires_at) = app.pairing.create_code(&member.group, &member.device);
+    app.stats.add("pair.codes", 1);
     Json(json!({ "code": code, "expiresAt": timestamp(expires_at) }))
 }
 
@@ -139,14 +183,31 @@ struct JoinRequest {
     spake: String,
 }
 
-/// Relays the joiner's SPAKE2 message to the inviter and waits for its answer.
+/// Counts a pairing step's failure by its error code.
+fn count_pairing<T>(app: &App, result: Result<T, ApiError>) -> Result<T, ApiError> {
+    if let Err(err) = &result {
+        app.stats.add(&format!("pair.fail.{}", err.code()), 1);
+    }
+    result
+}
+
 async fn join(
     State(app): State<AppState>,
     ClientIp(ip): ClientIp,
     ApiJson(req): ApiJson<JoinRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    app.limits.hit(Bucket::Join, ip)?;
-    app.limits.join_allowed()?;
+    app.stats.add("pair.joins", 1);
+    count_pairing(&app, relay_join(&app, ip, req).await)
+}
+
+/// Relays the joiner's SPAKE2 message to the inviter and waits for its answer.
+async fn relay_join(app: &App, ip: IpAddr, req: JoinRequest) -> Result<Json<Value>, ApiError> {
+    app.limits
+        .hit(Bucket::Join, ip)
+        .inspect_err(|_| app.stats.add("limit.joinsPerIp", 1))?;
+    app.limits
+        .join_allowed()
+        .inspect_err(|_| app.stats.add("limit.joinFailures", 1))?;
     check_device_id(&req.device_id)?;
     let join = app
         .pairing
@@ -218,9 +279,13 @@ async fn complete(
     Path(session): Path<String>,
     ApiJson(req): ApiJson<CompleteJoin>,
 ) -> Result<Json<Value>, ApiError> {
+    count_pairing(&app, finish_join(&app, &session, req).await)
+}
+
+async fn finish_join(app: &App, session: &str, req: CompleteJoin) -> Result<Json<Value>, ApiError> {
     let secret = hex32(&req.join_secret, "joinSecret")?;
     check_device_info(&req.info)?;
-    let (group, device) = app.pairing.finish(&session, secret.as_bytes())?;
+    let (group, device) = app.pairing.finish(session, secret.as_bytes())?;
     let token = random_token();
     db::add_device(
         &app.db,
@@ -234,6 +299,8 @@ async fn complete(
     .await?;
     app.pairing.cancel_code(&group);
     app.hub.broadcast(&group, &devices_frame(), &[]);
+    app.stats.add("pair.ok", 1);
+    app.stats.add("devices.joined", 1);
     tracing::info!("device joined group {group}");
     Ok(Json(json!({ "groupId": group, "deviceToken": token })))
 }
@@ -293,6 +360,7 @@ async fn remove_device(
         .await?
         .ok_or(ApiError::NotFound)?;
     app.hub.revoke(&member.group, &device);
+    app.stats.add("devices.removed", 1);
     match removed {
         Removed::Device => {
             app.hub.broadcast(&member.group, &devices_frame(), &[]);
@@ -300,6 +368,7 @@ async fn remove_device(
         Removed::Group(blobs) => {
             app.pairing.forget_group(&member.group);
             app.blobs.remove(blobs).await;
+            app.stats.add("groups.deleted", 1);
             tracing::info!("group {} deleted: its last device left", member.group);
         }
     }

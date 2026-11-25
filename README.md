@@ -66,6 +66,7 @@ docker compose up -d
 | `KP_SYNC_STORAGE_MB` | `2048` | 仅官方模式：全站最多存多少 MB 条目 |
 | `KP_SYNC_GROUP_FORWARD_MB_PER_DAY` | `200` | 仅官方模式：每组每天实时转发多少 MB 非图片条目（按送达设备数计，北京时间零点重置） |
 | `KP_SYNC_FRAMES_PER_DEVICE_PER_10MIN` | `1200` | 仅官方模式：每台设备每 10 分钟最多上传多少条 |
+| `KP_SYNC_STATS_TOKEN` | 不设 | 设置后（至少 32 个字符）开启只读统计接口，见下方「统计接口」；不设就没有这个接口，也不记录任何统计 |
 | `KP_SYNC_TRUST_PROXY` | 不设 | 设为 `1` 时从 `X-Real-IP` / `X-Forwarded-For` 取客户端 IP（只在反向代理后面用；官方模式的按 IP 限流靠它） |
 | `RUST_LOG` | `info` | 日志级别 |
 
@@ -132,8 +133,8 @@ server {
 1. 本机拉镜像再传过去（那台机器拉不了 Docker Hub，从 ghcr.io 下载也几乎不动）：
 
    ```bash
-   docker pull --platform linux/amd64 ghcr.io/mansandadada/kwikpaste-sync-server:1.2.0
-   docker save --platform linux/amd64 ghcr.io/mansandadada/kwikpaste-sync-server:1.2.0 | gzip > kps.tar.gz
+   docker pull --platform linux/amd64 ghcr.io/mansandadada/kwikpaste-sync-server:1.3.0
+   docker save --platform linux/amd64 ghcr.io/mansandadada/kwikpaste-sync-server:1.3.0 | gzip > kps.tar.gz
    scp kps.tar.gz root@<服务器>:/tmp/ && ssh root@<服务器> 'gunzip -c /tmp/kps.tar.gz | docker load'
    ```
 
@@ -169,7 +170,13 @@ server {
      --memory 256m --cpus 1 --log-opt max-size=10m --log-opt max-file=3 \
      --network kwikpaste-sync-net --ip 172.31.255.10 -v /home/kwikpaste-sync:/data \
      -e KP_SYNC_MODE=official -e KP_SYNC_TRUST_PROXY=1 \
-     ghcr.io/mansandadada/kwikpaste-sync-server:1.2.0
+     ghcr.io/mansandadada/kwikpaste-sync-server:1.3.0
+   ```
+
+   统计令牌放在只有 root 能读的环境文件里，再给上面的 `docker run` 加 `--env-file /etc/kwikpaste-sync.env`：
+
+   ```bash
+   umask 077 && echo "KP_SYNC_STATS_TOKEN=$(openssl rand -hex 32)" > /etc/kwikpaste-sync.env
    ```
 
    升级：按第 1 步传入新版本后 `docker rm -f kwikpaste-sync`，再用同样的参数 `docker run`（数据在卷里，不受影响；
@@ -185,7 +192,23 @@ server {
      --reloadcmd "docker exec nginx nginx -s reload"
    ```
 
+   配置里的 `location = /v1/stats` 默认拒绝所有人，在 `deny all;` 前加一行 `allow <拉统计的服务器 IP>;` 放行。
+
    `X-Real-IP` 不能少：服务开了 `KP_SYNC_TRUST_PROXY=1`，按 IP 限流用的就是它。`proxy_buffering off` 也不能少，否则事件流会被攒着不发。
+
+### 统计接口
+
+设置 `KP_SYNC_STATS_TOKEN` 后，`GET /v1/stats?days=30` 返回运营统计，请求头 `X-KwikPaste-Stats-Token` 带这个令牌
+（自部署服务器还要带服务器令牌）。`days` 取 1–400，默认 30。返回的只有聚合数字，没有组 ID、设备 ID、IP 和任何内容：
+
+- 当前：在线设备和组、有效的配对码、同步组 / 设备 / 条目总数、存储占用、各项限额、进程内存和数据目录大小。
+- 最近 24 小时每分钟：收发字节、每秒峰值、在线设备、上传条数。
+- 每天（北京时间）：按文本 / 图片 / 设置分开的上传与转发条数和字节、补发（离线设备上线后补齐）、配对和各类失败、
+  各项限额命中、请求与错误数、日 / 周 / 月活跃的设备和组，以及当天结束时的总数。
+- 近 7 天活跃设备的客户端版本和平台（取自请求头 `X-KwikPaste-Client`），以及每组设备数的分布。
+
+数据存在同一个 `sync.sqlite3` 里：每分钟的计数留 8 天，按天汇总长期保留；为了算日 / 周 / 月活跃，
+每天活跃过的设备（组 ID、设备 ID、客户端版本和平台）留 32 天。字节按密文计，不含 HTTP / TLS 开销。
 
 ## 本地运行（Windows）
 

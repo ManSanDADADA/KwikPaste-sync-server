@@ -9,7 +9,7 @@ use crate::{
     extract::Member,
     frames,
     limits::StorageUse,
-    timestamp, App, AppState,
+    stats, timestamp, App, AppState,
 };
 use std::sync::atomic::Ordering;
 
@@ -93,16 +93,21 @@ pub async fn upload(
     let mut results = Vec::new();
 
     while let Some((head, len)) = frames::read_head(&mut reader).await? {
-        total += 8 + head.len() as u64 + len;
+        let frame_bytes = 8 + head.len() as u64 + len;
+        total += frame_bytes;
         if app
             .config
             .limits
             .max_request_bytes
             .is_some_and(|max| total > max)
         {
+            app.stats.add("limit.requestBytes", 1);
             return Err(ApiError::TooLarge);
         }
-        app.limits.frame(&member.group, &member.device)?;
+        app.stats.bytes_in(frame_bytes);
+        app.limits
+            .frame(&member.group, &member.device)
+            .inspect_err(|_| app.stats.add("limit.frames", 1))?;
         let header: EntryHeader = match serde_json::from_slice(&head) {
             Ok(header) => header,
             Err(_) => {
@@ -111,6 +116,7 @@ pub async fn upload(
                     .ok()
                     .and_then(|v| Some(v.get("entryId")?.as_str()?.to_owned()))
                     .unwrap_or_default();
+                app.stats.add("reject.badRequest", 1);
                 results.push(rejected(&entry_id, "badRequest"));
                 continue;
             }
@@ -136,6 +142,7 @@ pub async fn upload(
             None
         };
         if let Some(error) = rejection {
+            app.stats.add(&format!("reject.{error}"), 1);
             skip_body(&mut reader, len).await?;
             results.push(rejected(&header.entry_id, error));
             continue;
@@ -160,6 +167,14 @@ pub async fn upload(
     Ok(Json(json!({ "results": results })))
 }
 
+/// Counts `times` entries of `len` bytes, e.g. `up.text.n` and `up.text.bytes`.
+fn count(app: &App, direction: &str, header: &EntryHeader, len: u64, times: u64) {
+    let bucket = stats::bucket(&header.kind, &header.class);
+    app.stats.add(&format!("{direction}.{bucket}.n"), times);
+    app.stats
+        .add(&format!("{direction}.{bucket}.bytes"), len * times);
+}
+
 fn rejected(entry_id: &str, error: &str) -> Value {
     json!({ "entryId": entry_id, "status": "rejected", "error": error })
 }
@@ -176,6 +191,7 @@ async fn skip_body<R: AsyncRead + Unpin>(reader: &mut R, len: u64) -> Result<(),
 fn forward_image(app: &App, member: &Member, header: &EntryHeader, body: &[u8]) -> Value {
     let len = body.len() as u64;
     if let Err(retry_at) = app.limits.image_allowed(&member.group, len) {
+        app.stats.add("limit.imageQuota", 1);
         return json!({
             "entryId": header.entry_id,
             "status": "rejected",
@@ -184,12 +200,15 @@ fn forward_image(app: &App, member: &Member, header: &EntryHeader, body: &[u8]) 
         });
     }
     let frame = header.event(None, &member.device, body);
-    if app
+    let delivered = app
         .hub
-        .broadcast(&member.group, &frame, &header.skip(&member.device))
-        > 0
-    {
+        .broadcast(&member.group, &frame, &header.skip(&member.device));
+    count(app, "up", header, len, 1);
+    count(app, "live", header, len, delivered as u64);
+    if delivered > 0 {
         app.limits.charge_image(&member.group, len);
+    } else {
+        app.stats.add("image.undelivered", 1);
     }
     json!({ "entryId": header.entry_id, "status": "forwarded" })
 }
@@ -214,6 +233,7 @@ async fn store(
     let forwards = header.class != "image";
     if forwards {
         if let Err(reset) = app.limits.forward_allowed(&member.group, charged) {
+            app.stats.add("limit.forward", 1);
             return Ok(quota(reset));
         }
     }
@@ -258,6 +278,7 @@ async fn store(
         {
             drop(lock);
             app.blobs.remove(blob).await;
+            app.stats.add("limit.storage", 1);
             return Ok(quota(Utc::now() + TimeDelta::hours(1)));
         }
     }
@@ -279,6 +300,8 @@ async fn store(
             app.limits
                 .charge_forward(&member.group, charged * delivered as u64);
         }
+        count(&app, "up", &header, body.len() as u64, 1);
+        count(&app, "live", &header, body.len() as u64, delivered as u64);
     }
     drop(lock);
 
@@ -291,6 +314,7 @@ async fn store(
         }
         Ok(Stored::Stale) => {
             app.blobs.remove(blob).await;
+            app.stats.add("up.stale", 1);
             Ok(json!({ "entryId": header.entry_id, "status": "stale" }))
         }
         Err(err) => {

@@ -190,6 +190,14 @@ impl Pairing {
             .retain(|_, s| s.created.elapsed() <= SESSION_TTL);
     }
 
+    /// Live codes and join sessions, for the statistics.
+    pub fn counts(&self) -> (usize, usize) {
+        let inner = self.lock();
+        let now = Instant::now();
+        let codes = inner.codes.values().filter(|c| c.expires > now).count();
+        (codes, inner.sessions.len())
+    }
+
     /// Wakes every waiting join so a graceful shutdown does not wait for them.
     pub fn clear(&self) {
         let mut inner = self.lock();

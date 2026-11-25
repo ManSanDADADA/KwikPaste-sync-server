@@ -29,6 +29,8 @@ struct Conn {
 pub struct Hub {
     groups: Mutex<HashMap<String, HashMap<String, Conn>>>,
     next_id: AtomicU64,
+    /// Streams dropped for falling behind, since the last [`Hub::take_dropped`].
+    dropped: AtomicUsize,
 }
 
 impl Hub {
@@ -88,6 +90,22 @@ impl Hub {
             .is_some_and(|members| members.contains_key(device))
     }
 
+    /// Every online (group, device).
+    pub fn online(&self) -> Vec<(String, String)> {
+        self.lock()
+            .iter()
+            .flat_map(|(group, members)| {
+                members
+                    .keys()
+                    .map(move |device| (group.clone(), device.clone()))
+            })
+            .collect()
+    }
+
+    pub fn take_dropped(&self) -> u64 {
+        self.dropped.swap(0, Ordering::Relaxed) as u64
+    }
+
     pub fn group_online(&self, group: &str) -> bool {
         self.lock()
             .get(group)
@@ -107,14 +125,21 @@ impl Hub {
             return true;
         }
         members.remove(device);
+        self.dropped.fetch_add(1, Ordering::Relaxed);
         false
     }
 
     /// Queues a frame for every online member except `skip`; returns how many got it.
     pub fn broadcast(&self, group: &str, frame: &Bytes, skip: &[&str]) -> usize {
-        self.lock()
-            .get_mut(group)
-            .map_or(0, |members| send_all(members, frame, skip))
+        let mut groups = self.lock();
+        let Some(members) = groups.get_mut(group) else {
+            return 0;
+        };
+        let before = members.len();
+        let sent = send_all(members, frame, skip);
+        self.dropped
+            .fetch_add(before - members.len(), Ordering::Relaxed);
+        sent
     }
 
     /// Sends `revoked` and closes the device's stream.

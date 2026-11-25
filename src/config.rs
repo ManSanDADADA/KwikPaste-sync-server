@@ -79,6 +79,8 @@ pub struct Config {
     /// Required in every request on a self-hosted server.
     pub server_token: Option<String>,
     pub trust_proxy: bool,
+    /// Enables `GET /v1/stats` and the statistics behind it.
+    pub stats_token: Option<String>,
     pub policy: Policy,
     pub limits: Limits,
 }
@@ -90,6 +92,7 @@ impl Config {
             data_dir,
             server_token: None,
             trust_proxy: false,
+            stats_token: None,
             policy: Policy {
                 history: false,
                 meta: false,
@@ -130,6 +133,7 @@ impl Config {
             data_dir,
             server_token: Some(server_token),
             trust_proxy: false,
+            stats_token: None,
             policy: Policy {
                 history: true,
                 meta: true,
@@ -198,6 +202,15 @@ pub fn from_env() -> Result<(Config, String, Option<TokenSource>)> {
         other => bail!("KP_SYNC_MODE must be `official` or `selfhost`, got `{other}`"),
     };
     config.trust_proxy = env::var("KP_SYNC_TRUST_PROXY").is_ok_and(|v| v == "1");
+    if let Ok(token) = env::var("KP_SYNC_STATS_TOKEN") {
+        let token = token.trim();
+        if !token.is_empty() {
+            if token.len() < 32 {
+                bail!("KP_SYNC_STATS_TOKEN must be at least 32 characters");
+            }
+            config.stats_token = Some(token.to_owned());
+        }
+    }
     Ok((config, listen, source))
 }
 

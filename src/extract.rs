@@ -37,6 +37,11 @@ impl FromRequestParts<AppState> for Member {
             db::touch_device(&app.db, &crate::token_hash(token.trim()), &crate::now())
                 .await?
                 .ok_or(ApiError::Unauthorized)?;
+        let client = parts
+            .headers
+            .get("x-kwikpaste-client")
+            .and_then(|v| v.to_str().ok());
+        app.stats.active(&group, &device, client);
         Ok(Self { group, device })
     }
 }

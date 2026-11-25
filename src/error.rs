@@ -38,6 +38,11 @@ impl ApiError {
         Self::BadRequest(message.into())
     }
 
+    /// The protocol error code, e.g. `codeInvalid`.
+    pub fn code(&self) -> &'static str {
+        self.parts().1
+    }
+
     fn parts(&self) -> (StatusCode, &'static str) {
         match self {
             Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "badRequest"),

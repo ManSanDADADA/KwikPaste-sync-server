@@ -4,7 +4,7 @@ use crate::{
     db::{self, EntryRow},
     error::ApiError,
     extract::{ApiQuery, Member},
-    frames, now, App, AppState,
+    frames, now, stats, App, AppState,
 };
 use axum::{
     body::{Body, Bytes},
@@ -42,6 +42,7 @@ pub async fn events(
     // Register before reading the max seq: anything stored later arrives live, so
     // catch-up up to `until` plus the live queue leaves no gap.
     let (id, rx, queued) = app.hub.connect(&member.group, &member.device);
+    app.stats.add("streams.opened", 1);
     let online = Online {
         app: app.clone(),
         group: member.group,
@@ -95,7 +96,14 @@ struct Events {
     ping: Interval,
 }
 
-async fn next(mut s: Events) -> Option<(Result<Bytes, Infallible>, Events)> {
+/// The next frame, counted as outbound bytes.
+async fn next(s: Events) -> Option<(Result<Bytes, Infallible>, Events)> {
+    let (frame, s) = next_frame(s).await?;
+    s.online.app.stats.bytes_out(frame.len() as u64);
+    Some((Ok(frame), s))
+}
+
+async fn next_frame(mut s: Events) -> Option<(Bytes, Events)> {
     loop {
         if !s.catching_up {
             let frame = tokio::select! {
@@ -106,11 +114,11 @@ async fn next(mut s: Events) -> Option<(Result<Bytes, Infallible>, Events)> {
                 },
                 _ = s.ping.tick() => frames::encode(&json!({ "type": "ping" }), &[]),
             };
-            return Some((Ok(frame), s));
+            return Some((frame, s));
         }
         if let Some(row) = s.page.pop_front() {
             match catch_up_frame(&s.online.app, row).await {
-                Some(frame) => return Some((Ok(frame), s)),
+                Some(frame) => return Some((frame, s)),
                 None => continue,
             }
         }
@@ -121,6 +129,7 @@ async fn next(mut s: Events) -> Option<(Result<Bytes, Infallible>, Events)> {
             Ok(rows) => rows,
             Err(err) => {
                 tracing::warn!("catch-up query failed: {err}");
+                app.stats.add("errors.catchup", 1);
                 return None;
             }
         };
@@ -132,7 +141,7 @@ async fn next(mut s: Events) -> Option<(Result<Bytes, Infallible>, Events)> {
             None => {
                 s.catching_up = false;
                 let synced = frames::encode(&json!({ "type": "synced", "seq": s.until }), &[]);
-                return Some((Ok(synced), s));
+                return Some((synced, s));
             }
         }
     }
@@ -151,6 +160,10 @@ async fn catch_up_frame(app: &App, row: EntryRow) -> Option<Bytes> {
         },
         (None, None) => Vec::new(),
     };
+    let bucket = stats::bucket(&row.kind, &row.class);
+    app.stats.add(&format!("catchup.{bucket}.n"), 1);
+    app.stats
+        .add(&format!("catchup.{bucket}.bytes"), body.len() as u64);
     let header = json!({
         "type": "entry",
         "seq": row.seq,
