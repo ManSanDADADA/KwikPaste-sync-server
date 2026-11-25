@@ -4,7 +4,7 @@ KwikPaste（快贴）远程同步的服务端：设备之间不在同一个局�
 
 - **端到端加密**：服务器只存、只转发密文，拿不到组密钥，也看不到剪贴板内容。
 - **没有账号**：第一台设备建组，其他设备输入 6 位配对码加入。
-- **一个程序两种模式**：`selfhost`（自部署，默认）和 `official`（官方服务器 `https://paste.fastthree.com/sync`）。
+- **一个程序两种模式**：`selfhost`（自部署，默认）和 `official`（官方服务器 `https://sync.fastthree.com`）。
 - 单个二进制 + SQLite，没有其他依赖。协议见 [`docs/PROTOCOL.md`](docs/PROTOCOL.md)。
 
 ## 自部署
@@ -105,29 +105,33 @@ server {
 官方模式只做立即同步：文本留 24 小时，图片只实时转发不存储（单张 ≤ 2 MiB，每组每天 30 MiB、全站每天 1 GiB，北京时间零点重置），
 不同步收藏等元数据，每组 10 台设备，每 IP 每天建组 10 次、每小时加入 30 次，90 天没有设备连接的组整组删除。
 
-1. 把 Linux 版二进制放到 `/usr/local/bin/kwikpaste-sync-server`，安装 [`deploy/kwikpaste-sync.service`](deploy/kwikpaste-sync.service)：
+现网部署在雨云宁波那台机器上（和 FT2 同机，不限流量、约 50M 对称带宽），是一个独立容器，nginx 也是那台机器上已有的 `nginx` 容器。
+
+1. 本机构建镜像并传过去（那台机器拉不了 Docker Hub）：
 
    ```bash
-   sudo cp deploy/kwikpaste-sync.service /etc/systemd/system/
-   sudo systemctl daemon-reload
-   sudo systemctl enable --now kwikpaste-sync
+   docker build -t kwikpaste-sync-server:1.0.0 .
+   docker save kwikpaste-sync-server:1.0.0 | gzip > kps.tar.gz
+   scp kps.tar.gz root@<服务器>:/tmp/ && ssh root@<服务器> 'gunzip -c /tmp/kps.tar.gz | docker load'
    ```
 
-   数据在 `/var/lib/kwikpaste-sync`，只监听 `127.0.0.1:8686`。
+2. 运行（端口只绑在 docker 网桥上，公网访问不到；数据目录要属于容器里的 uid 10001）：
 
-2. nginx（`paste.fastthree.com` 的 server 块里）：
-
-   ```nginx
-   location /sync/ {
-       proxy_pass http://127.0.0.1:8686/;
-       proxy_buffering off;
-       proxy_read_timeout 600s;
-       client_max_body_size 8m;
-       proxy_set_header X-Real-IP $remote_addr;
-   }
+   ```bash
+   mkdir -p /home/kwikpaste-sync && chown 10001:10001 /home/kwikpaste-sync
+   docker run -d --name kwikpaste-sync --restart unless-stopped      --memory 256m --cpus 1 --log-opt max-size=10m --log-opt max-file=3      -p 172.17.0.1:8686:8686 -v /home/kwikpaste-sync:/data      -e KP_SYNC_MODE=official -e KP_SYNC_TRUST_PROXY=1      kwikpaste-sync-server:1.0.0
    ```
 
-   `X-Real-IP` 这一行不能少：服务开了 `KP_SYNC_TRUST_PROXY=1`，按 IP 限流用的就是它。
+   升级：`docker load` 新镜像后 `docker rm -f kwikpaste-sync`，再用同样的参数 `docker run`（数据在卷里，不受影响）。
+
+3. nginx：[`deploy/nginx-official.conf`](deploy/nginx-official.conf) 放进 nginx 的 `conf.d/`，证书用 acme.sh（webroot）单独签发：
+
+   ```bash
+   acme.sh --issue -d sync.fastthree.com -w /home/nginx/html --keylength ec-256 --server letsencrypt
+   acme.sh --install-cert -d sync.fastthree.com --ecc      --key-file /home/nginx/certs/sync.fastthree.com/privkey.pem      --fullchain-file /home/nginx/certs/sync.fastthree.com/fullchain.pem      --reloadcmd "docker exec nginx nginx -s reload"
+   ```
+
+   `X-Real-IP` 不能少：服务开了 `KP_SYNC_TRUST_PROXY=1`，按 IP 限流用的就是它。`proxy_buffering off` 也不能少，否则事件流会被攒着不发。
 
 ## 本地运行（Windows）
 
