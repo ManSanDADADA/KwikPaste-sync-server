@@ -1,0 +1,20 @@
+services:
+  kwikpaste-sync:
+    # 国内网络可换成阿里云镜像，地址见 README。
+    image: ghcr.io/mansandadada/kwikpaste-sync-server:latest
+    container_name: kwikpaste-sync
+    restart: unless-stopped
+    ports:
+      - "8686:8686"
+    volumes:
+      - kwikpaste-sync-data:/data
+    environment:
+      KP_SYNC_MODE: selfhost
+      # 不填则首次启动自动生成，保存在 /data/server-token。
+      # KP_SYNC_TOKEN: change-me
+      # KP_SYNC_MAX_IMAGE_MB: "100"
+      # KP_SYNC_MAX_DEVICES: "20"
+      # KP_SYNC_TEXT_RETENTION_HOURS: "720"
+
+volumes:
+  kwikpaste-sync-data:
