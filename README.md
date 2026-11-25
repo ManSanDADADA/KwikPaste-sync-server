@@ -129,10 +129,12 @@ server {
 官方服务器是一个独立容器，放在那台机器已有的 `nginx` 容器后面。容器在一个单独的内部网络里：不对外发布端口，
 没有外网出口，也访问不到宿主机上的任何服务，只有 nginx 能连进来。
 
-1. 拉镜像（那台机器拉不了 Docker Hub，但能访问 ghcr.io）：
+1. 本机拉镜像再传过去（那台机器拉不了 Docker Hub，从 ghcr.io 下载也几乎不动）：
 
    ```bash
-   docker pull ghcr.io/mansandadada/kwikpaste-sync-server:1.2.0
+   docker pull --platform linux/amd64 ghcr.io/mansandadada/kwikpaste-sync-server:1.2.0
+   docker save --platform linux/amd64 ghcr.io/mansandadada/kwikpaste-sync-server:1.2.0 | gzip > kps.tar.gz
+   scp kps.tar.gz root@<服务器>:/tmp/ && ssh root@<服务器> 'gunzip -c /tmp/kps.tar.gz | docker load'
    ```
 
 2. 内部网络（只建一次）。`--internal` 去掉了外网出口；宿主机在这个网桥上仍有一个地址，所以再用一条防火墙规则挡住
@@ -170,7 +172,7 @@ server {
      ghcr.io/mansandadada/kwikpaste-sync-server:1.2.0
    ```
 
-   升级：`docker pull` 新版本后 `docker rm -f kwikpaste-sync`，再用同样的参数 `docker run`（数据在卷里，不受影响；
+   升级：按第 1 步传入新版本后 `docker rm -f kwikpaste-sync`，再用同样的参数 `docker run`（数据在卷里，不受影响；
    表结构有变化时要写迁移）。nginx 容器如果被重建，要重新 `docker network connect kwikpaste-sync-net nginx`。
 
 4. nginx：[`deploy/nginx-official.conf`](deploy/nginx-official.conf) 放进 nginx 的 `conf.d/`，证书用 acme.sh（webroot）单独签发：
