@@ -119,7 +119,11 @@ server {
 
    ```bash
    mkdir -p /home/kwikpaste-sync && chown 10001:10001 /home/kwikpaste-sync
-   docker run -d --name kwikpaste-sync --restart unless-stopped      --memory 256m --cpus 1 --log-opt max-size=10m --log-opt max-file=3      -p 172.17.0.1:8686:8686 -v /home/kwikpaste-sync:/data      -e KP_SYNC_MODE=official -e KP_SYNC_TRUST_PROXY=1      kwikpaste-sync-server:1.0.0
+   docker run -d --name kwikpaste-sync --restart unless-stopped \
+     --memory 256m --cpus 1 --log-opt max-size=10m --log-opt max-file=3 \
+     -p 172.17.0.1:8686:8686 -v /home/kwikpaste-sync:/data \
+     -e KP_SYNC_MODE=official -e KP_SYNC_TRUST_PROXY=1 \
+     kwikpaste-sync-server:1.0.0
    ```
 
    升级：`docker load` 新镜像后 `docker rm -f kwikpaste-sync`，再用同样的参数 `docker run`（数据在卷里，不受影响）。
@@ -128,7 +132,10 @@ server {
 
    ```bash
    acme.sh --issue -d sync.fastthree.com -w /home/nginx/html --keylength ec-256 --server letsencrypt
-   acme.sh --install-cert -d sync.fastthree.com --ecc      --key-file /home/nginx/certs/sync.fastthree.com/privkey.pem      --fullchain-file /home/nginx/certs/sync.fastthree.com/fullchain.pem      --reloadcmd "docker exec nginx nginx -s reload"
+   acme.sh --install-cert -d sync.fastthree.com --ecc \
+     --key-file /home/nginx/certs/sync.fastthree.com/privkey.pem \
+     --fullchain-file /home/nginx/certs/sync.fastthree.com/fullchain.pem \
+     --reloadcmd "docker exec nginx nginx -s reload"
    ```
 
    `X-Real-IP` 不能少：服务开了 `KP_SYNC_TRUST_PROXY=1`，按 IP 限流用的就是它。`proxy_buffering off` 也不能少，否则事件流会被攒着不发。
