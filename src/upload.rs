@@ -3,12 +3,18 @@
 
 use crate::{
     blobs::INLINE_MAX,
-    config::Images,
+    config::{Images, Mode},
     db::{self, NewEntry, Stored},
     error::ApiError,
     extract::Member,
-    frames, timestamp, App, AppState,
+    frames,
+    limits::StorageUse,
+    timestamp, App, AppState,
 };
+use std::sync::atomic::Ordering;
+
+/// Bytes charged per stored row on top of its body: ids, HLC and indexes cost disk too.
+const ROW_OVERHEAD: u64 = 512;
 use axum::{body::Body, extract::State, Json};
 use chrono::{TimeDelta, Utc};
 use futures_util::TryStreamExt;
@@ -37,11 +43,20 @@ fn live_default() -> bool {
 impl EntryHeader {
     fn valid(&self) -> bool {
         let short = |s: &str, max: usize| !s.is_empty() && s.len() <= max;
-        short(&self.entry_id, 64)
-            && short(&self.kind, 32)
-            && short(&self.class, 32)
-            && self.hlc.len() <= 128
-            && frames::parse_hlc(&self.hlc).is_some()
+        let entry_id =
+            self.entry_id.len() == 32 && self.entry_id.bytes().all(|b| b.is_ascii_hexdigit());
+        let hlc = frames::parse_hlc(&self.hlc).is_some_and(|(_, device)| {
+            device.len() == 20 && device.bytes().all(|b| b.is_ascii_hexdigit())
+        });
+        entry_id && short(&self.kind, 32) && short(&self.class, 32) && self.hlc.len() <= 128 && hlc
+    }
+
+    /// The kinds the client sends to the official server (no metadata, no history).
+    fn official_type(&self) -> bool {
+        matches!(
+            (self.kind.as_str(), self.class.as_str()),
+            ("item", "text") | ("item", "image") | ("settings", "none")
+        )
     }
 
     /// Event-stream header for this entry; `seq` is `None` for images that are not stored.
@@ -88,8 +103,18 @@ pub async fn upload(
             return Err(ApiError::TooLarge);
         }
         app.limits.frame(&member.group, &member.device)?;
-        let header: EntryHeader = serde_json::from_slice(&head)
-            .map_err(|err| ApiError::bad(format!("invalid frame header: {err}")))?;
+        let header: EntryHeader = match serde_json::from_slice(&head) {
+            Ok(header) => header,
+            Err(_) => {
+                skip_body(&mut reader, len).await?;
+                let entry_id = serde_json::from_slice::<Value>(&head)
+                    .ok()
+                    .and_then(|v| Some(v.get("entryId")?.as_str()?.to_owned()))
+                    .unwrap_or_default();
+                results.push(rejected(&entry_id, "badRequest"));
+                continue;
+            }
+        };
 
         let image = header.class == "image";
         let max = if image {
@@ -97,19 +122,22 @@ pub async fn upload(
         } else {
             policy.max_entry_bytes
         };
+        let settings_max = app.config.limits.max_settings_bytes;
         let rejection = if !header.valid() {
             Some("badRequest")
-        } else if len > max {
+        } else if len > max || (header.kind == "settings" && settings_max.is_some_and(|m| len > m))
+        {
             Some("tooLarge")
-        } else if header.kind == "meta" && !policy.meta {
+        } else if (header.kind == "meta" && !policy.meta)
+            || (app.config.mode == Mode::Official && !header.official_type())
+        {
             Some("policy")
         } else {
             None
         };
         if let Some(error) = rejection {
             skip_body(&mut reader, len).await?;
-            results
-                .push(json!({ "entryId": header.entry_id, "status": "rejected", "error": error }));
+            results.push(rejected(&header.entry_id, error));
             continue;
         }
 
@@ -121,11 +149,19 @@ pub async fn upload(
         let result = if image && policy.images == Images::Live {
             forward_image(&app, &member, &header, &body)
         } else {
-            store(&app, &member, &header, &body).await?
+            // Its own task: a client that disconnects mid-request drops this handler, and
+            // that must not happen between the commit and the broadcast.
+            tokio::spawn(store(app.clone(), member.clone(), header, body))
+                .await
+                .map_err(|err| ApiError::Internal(err.into()))??
         };
         results.push(result);
     }
     Ok(Json(json!({ "results": results })))
+}
+
+fn rejected(entry_id: &str, error: &str) -> Value {
+    json!({ "entryId": entry_id, "status": "rejected", "error": error })
 }
 
 async fn skip_body<R: AsyncRead + Unpin>(reader: &mut R, len: u64) -> Result<(), ApiError> {
@@ -158,14 +194,15 @@ fn forward_image(app: &App, member: &Member, header: &EntryHeader, body: &[u8]) 
     json!({ "entryId": header.entry_id, "status": "forwarded" })
 }
 
-/// Last-writer-wins store, then forward with the new `seq`.
+/// Last-writer-wins store, then forward with the new `seq`. Storage and forwarding are
+/// charged per row on top of the body, so empty entries are not free.
 async fn store(
-    app: &App,
-    member: &Member,
-    header: &EntryHeader,
-    body: &[u8],
+    app: AppState,
+    member: Member,
+    header: EntryHeader,
+    body: Vec<u8>,
 ) -> Result<Value, ApiError> {
-    let len = body.len() as u64;
+    let charged = body.len() as u64 + ROW_OVERHEAD;
     let quota = |retry_at| {
         json!({
             "entryId": header.entry_id,
@@ -174,20 +211,15 @@ async fn store(
             "retryAt": timestamp(retry_at),
         })
     };
-    let (group_used, global_used) =
-        db::stored_bytes(&app.db, &member.group, &header.entry_id).await?;
-    if !app.limits.storage_allowed(group_used, global_used, len) {
-        return Ok(quota(Utc::now() + TimeDelta::hours(1)));
-    }
     let forwards = header.class != "image";
     if forwards {
-        if let Err(reset) = app.limits.forward_allowed(&member.group, len) {
+        if let Err(reset) = app.limits.forward_allowed(&member.group, charged) {
             return Ok(quota(reset));
         }
     }
 
     let blob = if body.len() > INLINE_MAX {
-        Some(app.blobs.write(body).await?)
+        Some(app.blobs.write(&body).await?)
     } else {
         None
     };
@@ -204,28 +236,56 @@ async fn store(
         class: &header.class,
         hlc: &header.hlc,
         from_device: &member.device,
-        body: blob.is_none().then_some(body),
+        body: blob.is_none().then_some(body.as_slice()),
         blob: blob.as_deref(),
         expires_at: expires_at.as_deref(),
-        size: len,
+        size: charged,
     };
 
+    // Usage is checked under the store lock, so concurrent uploads cannot overshoot a cap.
     let lock = app.store_lock.lock().await;
+    if app.limits.caps_storage() {
+        let (group, persistent, replaced) =
+            db::group_bytes(&app.db, &member.group, &header.entry_id).await?;
+        let used = StorageUse {
+            group,
+            persistent,
+            global: app.stored.load(Ordering::Relaxed).saturating_sub(replaced),
+        };
+        if !app
+            .limits
+            .storage_allowed(&used, charged, expires_at.is_none())
+        {
+            drop(lock);
+            app.blobs.remove(blob).await;
+            return Ok(quota(Utc::now() + TimeDelta::hours(1)));
+        }
+    }
     let stored = db::store_entry(&app.db, &entry).await;
-    if let Ok(Stored::New { seq, .. }) = &stored {
-        let frame = header.event(Some(*seq), &member.device, body);
+    if let Ok(Stored::New {
+        seq, replaced_size, ..
+    }) = &stored
+    {
+        let total = app.stored.load(Ordering::Relaxed);
+        app.stored.store(
+            (total + charged).saturating_sub(*replaced_size),
+            Ordering::Relaxed,
+        );
+        let frame = header.event(Some(*seq), &member.device, &body);
         let delivered = app
             .hub
             .broadcast(&member.group, &frame, &header.skip(&member.device));
         if forwards {
             app.limits
-                .charge_forward(&member.group, len * delivered as u64);
+                .charge_forward(&member.group, charged * delivered as u64);
         }
     }
     drop(lock);
 
     match stored {
-        Ok(Stored::New { seq, replaced_blob }) => {
+        Ok(Stored::New {
+            seq, replaced_blob, ..
+        }) => {
             app.blobs.remove(replaced_blob).await;
             Ok(json!({ "entryId": header.entry_id, "status": "stored", "seq": seq }))
         }

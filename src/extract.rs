@@ -17,6 +17,7 @@ pub struct ApiJson<T>(pub T);
 pub struct ApiQuery<T>(pub T);
 
 /// A device authenticated by `Authorization: Bearer <device token>`.
+#[derive(Clone)]
 pub struct Member {
     pub group: String,
     pub device: String,

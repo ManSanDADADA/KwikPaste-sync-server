@@ -51,9 +51,13 @@ pub struct Limits {
     pub idle_group_days: Option<i64>,
     /// `codeInvalid` join failures, all IPs together, per rolling hour.
     pub join_failures_per_hour: Option<u32>,
-    /// Stored body bytes per group.
+    /// Stored bytes per group (body plus a fixed per-row overhead).
     pub group_storage: Option<u64>,
-    /// Stored body bytes over all groups.
+    /// Stored bytes per group that never expire (settings).
+    pub group_persistent_storage: Option<u64>,
+    /// Largest settings entry body.
+    pub max_settings_bytes: Option<u64>,
+    /// Stored bytes over all groups.
     pub storage: Option<u64>,
     /// Non-image bytes forwarded live per group per day (Asia/Shanghai).
     pub group_forward_per_day: Option<u64>,
@@ -111,6 +115,8 @@ impl Config {
                 idle_group_days: Some(90),
                 join_failures_per_hour: Some(1000),
                 group_storage: Some(20 * MIB),
+                group_persistent_storage: Some(MIB),
+                max_settings_bytes: Some(64 * 1024),
                 storage: Some(2048 * MIB),
                 group_forward_per_day: Some(200 * MIB),
                 frames_per_device_per_10min: Some(1200),
@@ -219,7 +225,12 @@ fn server_token(data_dir: &std::path::Path) -> Result<(String, TokenSource)> {
         }
     }
     let token = crate::random_token();
-    fs::write(&path, format!("{token}\n"))
-        .with_context(|| format!("cannot write {}", path.display()))?;
+    fs::write(&path, format!("{token}\n")).with_context(|| {
+        format!(
+            "cannot write {}: the data directory must be writable by uid 10001 \
+             (for a host directory: chown 10001:10001 <dir>)",
+            path.display()
+        )
+    })?;
     Ok((token, TokenSource::File(path)))
 }

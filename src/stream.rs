@@ -15,6 +15,10 @@ use axum::{
 use futures_util::stream;
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::{collections::VecDeque, convert::Infallible, time::Duration};
 use tokio::{
     sync::mpsc,
@@ -37,7 +41,7 @@ pub async fn events(
 ) -> Result<Response, ApiError> {
     // Register before reading the max seq: anything stored later arrives live, so
     // catch-up up to `until` plus the live queue leaves no gap.
-    let (id, rx) = app.hub.connect(&member.group, &member.device);
+    let (id, rx, queued) = app.hub.connect(&member.group, &member.device);
     let online = Online {
         app: app.clone(),
         group: member.group,
@@ -53,6 +57,7 @@ pub async fn events(
     let events = Events {
         online,
         rx,
+        queued,
         after,
         until,
         items: query.items.as_deref() != Some("none"),
@@ -81,6 +86,7 @@ impl Drop for Online {
 struct Events {
     online: Online,
     rx: mpsc::Receiver<Bytes>,
+    queued: Arc<AtomicUsize>,
     after: i64,
     until: i64,
     items: bool,
@@ -93,7 +99,11 @@ async fn next(mut s: Events) -> Option<(Result<Bytes, Infallible>, Events)> {
     loop {
         if !s.catching_up {
             let frame = tokio::select! {
-                frame = s.rx.recv() => frame?,
+                frame = s.rx.recv() => {
+                    let frame = frame?;
+                    s.queued.fetch_sub(frame.len(), Ordering::Relaxed);
+                    frame
+                },
                 _ = s.ping.tick() => frames::encode(&json!({ "type": "ping" }), &[]),
             };
             return Some((Ok(frame), s));

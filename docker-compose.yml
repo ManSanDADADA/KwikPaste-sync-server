@@ -1,6 +1,5 @@
 services:
   kwikpaste-sync:
-    # 国内网络可换成阿里云镜像，地址见 README。
     image: ghcr.io/mansandadada/kwikpaste-sync-server:latest
     container_name: kwikpaste-sync
     restart: unless-stopped

@@ -23,6 +23,7 @@ use subtle::ConstantTimeEq;
 
 /// How long `POST /v1/join` waits for the inviter's reply.
 const JOIN_WAIT: Duration = Duration::from_secs(60);
+const DEVICE_INFO_MAX: usize = 2 * 1024;
 
 pub fn router(app: AppState) -> Router {
     Router::new()
@@ -73,6 +74,14 @@ fn check_device_id(id: &str) -> Result<(), ApiError> {
     }
 }
 
+fn check_device_info(info: &str) -> Result<(), ApiError> {
+    if info.len() <= DEVICE_INFO_MAX {
+        Ok(())
+    } else {
+        Err(ApiError::TooLarge)
+    }
+}
+
 async fn info(State(app): State<AppState>) -> Json<Value> {
     Json(json!({
         "protocol": { "min": 1, "max": 1 },
@@ -96,6 +105,7 @@ async fn create_group(
 ) -> Result<Json<Value>, ApiError> {
     app.limits.hit(Bucket::Groups, ip)?;
     check_device_id(&req.device_id)?;
+    check_device_info(&req.info)?;
     let group = uuid::Uuid::new_v4().to_string();
     let token = random_token();
     db::create_group(
@@ -209,6 +219,7 @@ async fn complete(
     ApiJson(req): ApiJson<CompleteJoin>,
 ) -> Result<Json<Value>, ApiError> {
     let secret = hex32(&req.join_secret, "joinSecret")?;
+    check_device_info(&req.info)?;
     let (group, device) = app.pairing.finish(&session, secret.as_bytes())?;
     let token = random_token();
     db::add_device(
@@ -265,6 +276,7 @@ async fn update_self(
     member: Member,
     ApiJson(req): ApiJson<DeviceInfo>,
 ) -> Result<Json<Value>, ApiError> {
+    check_device_info(&req.info)?;
     db::update_device_info(&app.db, &member.group, &member.device, &req.info).await?;
     app.hub
         .broadcast(&member.group, &devices_frame(), &[&member.device]);

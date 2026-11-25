@@ -9,7 +9,8 @@ FROM alpine:3
 RUN adduser -D -H -u 10001 kwikpaste && mkdir /data && chown kwikpaste:kwikpaste /data
 COPY --from=build /src/target/release/kwikpaste-sync-server /usr/local/bin/kwikpaste-sync-server
 ENV KP_SYNC_DATA=/data \
-    KP_SYNC_LISTEN=0.0.0.0:8686
+    KP_SYNC_LISTEN=0.0.0.0:8686 \
+    NO_COLOR=1
 VOLUME /data
 EXPOSE 8686
 USER kwikpaste

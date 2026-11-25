@@ -19,7 +19,16 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{SecondsFormat, TimeDelta, Utc};
 use rand::RngCore;
 use sqlx::SqlitePool;
-use std::{collections::HashSet, future::Future, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    future::Future,
+    net::SocketAddr,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio::net::TcpListener;
 
 pub use config::Config;
@@ -33,6 +42,8 @@ pub struct App {
     limits: limits::Limits,
     /// Serializes store + forward so live entries go out in `seq` order.
     store_lock: tokio::sync::Mutex<()>,
+    /// Stored bytes over all groups; changed under `store_lock`, recounted on every purge.
+    stored: AtomicU64,
 }
 
 pub type AppState = Arc<App>;
@@ -45,6 +56,7 @@ pub async fn serve(
 ) -> anyhow::Result<()> {
     let db = db::open(&config.data_dir).await?;
     let blobs = blobs::Blobs::open(&config.data_dir).context("cannot create blobs directory")?;
+    let stored = AtomicU64::new(db::total_bytes(&db).await?);
     let app = Arc::new(App {
         limits: limits::Limits::new(config.limits.clone()),
         config,
@@ -53,6 +65,7 @@ pub async fn serve(
         hub: hub::Hub::default(),
         pairing: pairing::Pairing::default(),
         store_lock: tokio::sync::Mutex::new(()),
+        stored,
     });
 
     let purger = tokio::spawn(purge_loop(app.clone()));
@@ -102,6 +115,12 @@ async fn purge(app: &App) -> anyhow::Result<()> {
             app.pairing.forget_group(&group);
             tracing::info!("deleted idle group {group}");
         }
+    }
+
+    {
+        let _lock = app.store_lock.lock().await;
+        app.stored
+            .store(db::total_bytes(&app.db).await?, Ordering::Relaxed);
     }
 
     let referenced: HashSet<String> = db::blob_names(&app.db).await?.into_iter().collect();

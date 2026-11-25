@@ -17,7 +17,14 @@ docker run -d --name kwikpaste-sync --restart unless-stopped \
   ghcr.io/mansandadada/kwikpaste-sync-server:latest
 ```
 
-国内拉不动 ghcr.io 时换成阿里云镜像 `registry.cn-hangzhou.aliyuncs.com/<命名空间>/kwikpaste-sync-server:latest`（以发布说明里给出的地址为准）。
+想把数据放在宿主机的某个目录（NAS 上常见），把 `-v kwikpaste-sync-data:/data` 换成 `-v /volume1/docker/kwikpaste-sync:/data`，
+并先让这个目录归容器里的用户（uid 10001）所有，否则服务写不进数据，会反复重启：
+
+```bash
+mkdir -p /volume1/docker/kwikpaste-sync && chown 10001:10001 /volume1/docker/kwikpaste-sync
+```
+
+镜像同时支持 `linux/amd64` 和 `linux/arm64`。目前只发布在 ghcr.io，暂时没有国内镜像。
 
 ### docker compose
 
@@ -100,6 +107,11 @@ server {
 
 这时 Docker 端口可以只绑本机：`-p 127.0.0.1:8686:8686`。
 
+### 没有公网 IP
+
+家里的 NAS 没有公网 IP 也能用：设备之间用 Tailscale、ZeroTier 这类组网工具连通，或者用内网穿透，
+在 KwikPaste 里填设备能访问到的地址（如 `http://100.64.0.2:8686`）。只在同一个局域网里用的话，直接用局域网同步更省事。
+
 ### 数据与备份
 
 所有数据都在 `/data` 卷里。备份时先停容器再复制整个卷；删掉卷就清空了服务器（客户端会重新上传）。
@@ -111,16 +123,16 @@ server {
 不同步收藏等元数据，每组 10 台设备，每 IP 每天建组 10 次、每小时加入 30 次，90 天没有设备连接的组整组删除。
 配对码是 8 位数字，全站每小时最多 1000 次配对码错误，超过后所有加入请求暂停到最早一次错误滑出一小时窗口。
 每组最多存 20 MiB、全站最多存 2 GiB，每组每天实时转发 200 MiB 非图片条目，每台设备每 10 分钟最多上传 1200 条；存储与转发超限的条目单条返回 `quota` 和 `retryAt`，上传频率超限整个请求返回 429。以上数值都可用上面的环境变量调整。
+另外固定：每条按密文加 512 字节计入存储和转发；只收文本、图片和设置三种条目，单条设置 ≤ 64 KiB，每组永久保留的条目（设置）合计 ≤ 1 MiB；
+不读数据的事件流积压超过 4 MiB 就断开；nginx 限每个 IP 最多 16 个并发连接。
 
 官方服务器是一个独立容器，放在那台机器已有的 `nginx` 容器后面。容器在一个单独的内部网络里：不对外发布端口，
 没有外网出口，也访问不到宿主机上的任何服务，只有 nginx 能连进来。
 
-1. 本机构建镜像并传过去（那台机器拉不了 Docker Hub）：
+1. 拉镜像（那台机器拉不了 Docker Hub，但能访问 ghcr.io）：
 
    ```bash
-   docker build -t kwikpaste-sync-server:1.1.0 .
-   docker save kwikpaste-sync-server:1.1.0 | gzip > kps.tar.gz
-   scp kps.tar.gz root@<服务器>:/tmp/ && ssh root@<服务器> 'gunzip -c /tmp/kps.tar.gz | docker load'
+   docker pull ghcr.io/mansandadada/kwikpaste-sync-server:1.2.0
    ```
 
 2. 内部网络（只建一次）。`--internal` 去掉了外网出口；宿主机在这个网桥上仍有一个地址，所以再用一条防火墙规则挡住
@@ -155,10 +167,10 @@ server {
      --memory 256m --cpus 1 --log-opt max-size=10m --log-opt max-file=3 \
      --network kwikpaste-sync-net --ip 172.31.255.10 -v /home/kwikpaste-sync:/data \
      -e KP_SYNC_MODE=official -e KP_SYNC_TRUST_PROXY=1 \
-     kwikpaste-sync-server:1.1.0
+     ghcr.io/mansandadada/kwikpaste-sync-server:1.2.0
    ```
 
-   升级：`docker load` 新镜像后 `docker rm -f kwikpaste-sync`，再用同样的参数 `docker run`（数据在卷里，不受影响；
+   升级：`docker pull` 新版本后 `docker rm -f kwikpaste-sync`，再用同样的参数 `docker run`（数据在卷里，不受影响；
    表结构有变化时要写迁移）。nginx 容器如果被重建，要重新 `docker network connect kwikpaste-sync-net nginx`。
 
 4. nginx：[`deploy/nginx-official.conf`](deploy/nginx-official.conf) 放进 nginx 的 `conf.d/`，证书用 acme.sh（webroot）单独签发：

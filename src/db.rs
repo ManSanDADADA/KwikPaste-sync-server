@@ -255,10 +255,11 @@ pub struct NewEntry<'a> {
 }
 
 pub enum Stored {
-    /// Stored under `seq`; `replaced_blob` belonged to the previous version.
+    /// Stored under `seq`; `replaced_blob` and `replaced_size` belonged to the previous version.
     New {
         seq: i64,
         replaced_blob: Option<String>,
+        replaced_size: u64,
     },
     Stale,
 }
@@ -274,13 +275,13 @@ pub async fn store_entry(pool: &SqlitePool, e: &NewEntry<'_>) -> Result<Stored, 
     let Some(seq) = seq else {
         return Err(ApiError::Unauthorized);
     };
-    let existing: Option<(String, Option<String>)> =
-        sqlx::query_as("SELECT hlc, blob FROM entries WHERE group_id = ? AND entry_id = ?")
+    let existing: Option<(String, Option<String>, i64)> =
+        sqlx::query_as("SELECT hlc, blob, size FROM entries WHERE group_id = ? AND entry_id = ?")
             .bind(e.group_id)
             .bind(e.entry_id)
             .fetch_optional(&mut *tx)
             .await?;
-    if let Some((old_hlc, _)) = &existing {
+    if let Some((old_hlc, _, _)) = &existing {
         if !hlc_newer(e.hlc, old_hlc) {
             return Ok(Stored::Stale);
         }
@@ -307,37 +308,49 @@ pub async fn store_entry(pool: &SqlitePool, e: &NewEntry<'_>) -> Result<Stored, 
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
+    let (replaced_blob, replaced_size) = existing.map_or((None, 0), |(_, blob, size)| {
+        (blob, u64::try_from(size).unwrap_or(0))
+    });
     Ok(Stored::New {
         seq,
-        replaced_blob: existing.and_then(|(_, blob)| blob),
+        replaced_blob,
+        replaced_size,
     })
 }
 
-/// Stored body bytes of the group and of all groups, each without `entry_id`'s current version.
-pub async fn stored_bytes(
+/// Stored bytes of the group: all entries and those that never expire, each without
+/// `entry_id`'s current version, plus the size of that version.
+pub async fn group_bytes(
     pool: &SqlitePool,
     group_id: &str,
     entry_id: &str,
-) -> Result<(u64, u64), sqlx::Error> {
-    let replaced: Option<i64> =
-        sqlx::query_scalar("SELECT size FROM entries WHERE group_id = ? AND entry_id = ?")
-            .bind(group_id)
-            .bind(entry_id)
-            .fetch_optional(pool)
-            .await?;
-    let group: i64 =
-        sqlx::query_scalar("SELECT COALESCE(SUM(size), 0) FROM entries WHERE group_id = ?")
-            .bind(group_id)
-            .fetch_one(pool)
-            .await?;
-    let all: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(size), 0) FROM entries")
+) -> Result<(u64, u64, u64), sqlx::Error> {
+    let (all, persistent, replaced, replaced_persistent): (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT COALESCE(SUM(size), 0),
+                COALESCE(SUM(CASE WHEN expires_at IS NULL THEN size END), 0),
+                COALESCE(SUM(CASE WHEN entry_id = ? THEN size END), 0),
+                COALESCE(SUM(CASE WHEN entry_id = ? AND expires_at IS NULL THEN size END), 0)
+         FROM entries WHERE group_id = ?",
+    )
+    .bind(entry_id)
+    .bind(entry_id)
+    .bind(group_id)
+    .fetch_one(pool)
+    .await?;
+    let bytes = |n: i64| u64::try_from(n).unwrap_or(0);
+    Ok((
+        bytes(all - replaced),
+        bytes(persistent - replaced_persistent),
+        bytes(replaced),
+    ))
+}
+
+/// Stored bytes over all groups.
+pub async fn total_bytes(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
+    let total: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(size), 0) FROM entries")
         .fetch_one(pool)
         .await?;
-    let replaced = replaced.unwrap_or(0);
-    Ok((
-        u64::try_from(group - replaced).unwrap_or(0),
-        u64::try_from(all - replaced).unwrap_or(0),
-    ))
+    Ok(u64::try_from(total).unwrap_or(0))
 }
 
 pub async fn max_seq(pool: &SqlitePool, group_id: &str) -> Result<i64, sqlx::Error> {
@@ -374,7 +387,7 @@ pub async fn catch_up_page(
          WHERE group_id = ? AND seq > ? AND seq <= ?
            AND (expires_at IS NULL OR expires_at > ?)
            AND (? OR kind NOT IN ('item', 'meta'))
-         ORDER BY seq LIMIT 64",
+         ORDER BY seq LIMIT 8",
     )
     .bind(group_id)
     .bind(after)

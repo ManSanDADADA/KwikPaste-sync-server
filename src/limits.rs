@@ -10,6 +10,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Stored bytes, each without the version of the entry being replaced.
+pub struct StorageUse {
+    pub group: u64,
+    /// The group's entries that never expire.
+    pub persistent: u64,
+    pub global: u64,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Bucket {
     Groups,
@@ -194,10 +202,19 @@ impl Limits {
         Ok(())
     }
 
-    /// Whether `len` more stored bytes fit the group and global caps.
-    pub fn storage_allowed(&self, group_used: u64, global_used: u64, len: u64) -> bool {
+    /// Whether any storage cap is set; without one the usage is not even looked up.
+    pub fn caps_storage(&self) -> bool {
+        let c = &self.config;
+        c.group_storage.is_some() || c.group_persistent_storage.is_some() || c.storage.is_some()
+    }
+
+    /// Whether `len` more stored bytes fit the group, global and (for entries that never
+    /// expire) the group's persistent cap.
+    pub fn storage_allowed(&self, used: &StorageUse, len: u64, persistent: bool) -> bool {
         let fits = |used: u64, cap: Option<u64>| cap.is_none_or(|cap| used + len <= cap);
-        fits(group_used, self.config.group_storage) && fits(global_used, self.config.storage)
+        fits(used.group, self.config.group_storage)
+            && fits(used.global, self.config.storage)
+            && (!persistent || fits(used.persistent, self.config.group_persistent_storage))
     }
 
     pub fn purge(&self) {

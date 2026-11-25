@@ -605,7 +605,8 @@ fn text_frame(id: u32, clock: u64, body: &[u8]) -> (Value, Vec<u8>) {
 async fn official_group_storage_cap() {
     let s = Server::start(|dir| {
         let mut config = Config::official(dir);
-        config.limits.group_storage = Some(100);
+        // Each row costs its body plus 512 bytes: 572 fits once, not twice.
+        config.limits.group_storage = Some(1100);
         config
     })
     .await;
@@ -631,7 +632,7 @@ async fn official_group_storage_cap() {
 async fn official_forward_budget() {
     let s = Server::start(|dir| {
         let mut config = Config::official(dir);
-        config.limits.group_forward_per_day = Some(100);
+        config.limits.group_forward_per_day = Some(1100);
         config
     })
     .await;
@@ -641,7 +642,7 @@ async fn official_forward_budget() {
     let tb = s.pair(&ta, &mut ea, B).await;
     let _eb = s.events(&tb, "after=0").await;
 
-    // B is online, so 60 bytes forwarded leaves no room for another 60.
+    // B is online, so 60 + 512 bytes forwarded leaves no room for another 572.
     let results = s.upload(&ta, &[text_frame(1, 1, &[0; 60])]).await;
     assert_eq!(results[0]["status"], "stored");
     let results = s.upload(&ta, &[text_frame(2, 2, &[0; 60])]).await;
@@ -696,4 +697,65 @@ async fn official_device_frame_rate() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     assert!(resp.headers().contains_key("retry-after"));
+}
+
+#[tokio::test]
+async fn official_rejects_free_rows_and_unexpected_entries() {
+    let s = Server::start(|dir| {
+        let mut config = Config::official(dir);
+        config.limits.group_storage = Some(3000);
+        config.limits.group_persistent_storage = Some(1100);
+        config
+    })
+    .await;
+    let ta = s.create_group(A).await;
+    let settings =
+        |id, clock, body: &[u8]| (entry(id, "settings", "none", clock, A), body.to_vec());
+    let outcome = |results: &[Value]| -> Vec<String> {
+        results
+            .iter()
+            .map(|r| {
+                r["error"]
+                    .as_str()
+                    .or(r["status"].as_str())
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect()
+    };
+
+    // Empty settings rows still cost 512 bytes each against the persistent cap.
+    let results = s
+        .upload(
+            &ta,
+            &[
+                settings(1, 1, b""),
+                settings(2, 2, b""),
+                settings(3, 3, b""),
+            ],
+        )
+        .await;
+    assert_eq!(outcome(&results), ["stored", "stored", "quota"]);
+
+    // A malformed header, a wrong id shape, a kind the client never sends to the official
+    // server and oversized settings are each rejected; the rest of the request goes on.
+    let mut bad_id = entry(5, "item", "text", 5, A);
+    bad_id["entryId"] = json!("not-hex");
+    let results = s
+        .upload(
+            &ta,
+            &[
+                (json!({ "entryId": "x" }), b"ab".to_vec()),
+                (bad_id, Vec::new()),
+                (entry(6, "item", "files", 6, A), Vec::new()),
+                settings(7, 7, &[0; 64 * 1024 + 1]),
+                text_frame(8, 8, b"ok"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        outcome(&results),
+        ["badRequest", "badRequest", "policy", "tooLarge", "stored"]
+    );
+    assert_eq!(results[0]["entryId"], "x");
 }
