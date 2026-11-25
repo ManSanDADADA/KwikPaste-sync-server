@@ -31,11 +31,13 @@ CREATE TABLE IF NOT EXISTS entries (
     class TEXT NOT NULL,
     hlc TEXT NOT NULL,
     from_device TEXT NOT NULL,
+    size INTEGER NOT NULL,
     body BLOB,
     blob TEXT,
     expires_at TEXT,
     PRIMARY KEY (group_id, entry_id)
 );
+CREATE INDEX IF NOT EXISTS entries_by_size ON entries (group_id, size);
 CREATE INDEX IF NOT EXISTS entries_by_seq ON entries (group_id, seq);
 CREATE INDEX IF NOT EXISTS entries_by_expiry ON entries (expires_at) WHERE expires_at IS NOT NULL;
 ";
@@ -246,6 +248,7 @@ pub struct NewEntry<'a> {
     pub class: &'a str,
     pub hlc: &'a str,
     pub from_device: &'a str,
+    pub size: u64,
     pub body: Option<&'a [u8]>,
     pub blob: Option<&'a str>,
     pub expires_at: Option<&'a str>,
@@ -283,11 +286,11 @@ pub async fn store_entry(pool: &SqlitePool, e: &NewEntry<'_>) -> Result<Stored, 
         }
     }
     sqlx::query(
-        "INSERT INTO entries (group_id, entry_id, seq, kind, class, hlc, from_device, body, blob, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "INSERT INTO entries (group_id, entry_id, seq, kind, class, hlc, from_device, size, body, blob, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (group_id, entry_id) DO UPDATE SET
              seq = excluded.seq, kind = excluded.kind, class = excluded.class, hlc = excluded.hlc,
-             from_device = excluded.from_device, body = excluded.body, blob = excluded.blob,
+             from_device = excluded.from_device, size = excluded.size, body = excluded.body, blob = excluded.blob,
              expires_at = excluded.expires_at",
     )
     .bind(e.group_id)
@@ -297,6 +300,7 @@ pub async fn store_entry(pool: &SqlitePool, e: &NewEntry<'_>) -> Result<Stored, 
     .bind(e.class)
     .bind(e.hlc)
     .bind(e.from_device)
+    .bind(i64::try_from(e.size).unwrap_or(i64::MAX))
     .bind(e.body)
     .bind(e.blob)
     .bind(e.expires_at)
@@ -307,6 +311,33 @@ pub async fn store_entry(pool: &SqlitePool, e: &NewEntry<'_>) -> Result<Stored, 
         seq,
         replaced_blob: existing.and_then(|(_, blob)| blob),
     })
+}
+
+/// Stored body bytes of the group and of all groups, each without `entry_id`'s current version.
+pub async fn stored_bytes(
+    pool: &SqlitePool,
+    group_id: &str,
+    entry_id: &str,
+) -> Result<(u64, u64), sqlx::Error> {
+    let replaced: Option<i64> =
+        sqlx::query_scalar("SELECT size FROM entries WHERE group_id = ? AND entry_id = ?")
+            .bind(group_id)
+            .bind(entry_id)
+            .fetch_optional(pool)
+            .await?;
+    let group: i64 =
+        sqlx::query_scalar("SELECT COALESCE(SUM(size), 0) FROM entries WHERE group_id = ?")
+            .bind(group_id)
+            .fetch_one(pool)
+            .await?;
+    let all: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(size), 0) FROM entries")
+        .fetch_one(pool)
+        .await?;
+    let replaced = replaced.unwrap_or(0);
+    Ok((
+        u64::try_from(group - replaced).unwrap_or(0),
+        u64::try_from(all - replaced).unwrap_or(0),
+    ))
 }
 
 pub async fn max_seq(pool: &SqlitePool, group_id: &str) -> Result<i64, sqlx::Error> {

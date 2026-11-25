@@ -136,8 +136,16 @@ async fn join(
     ApiJson(req): ApiJson<JoinRequest>,
 ) -> Result<Json<Value>, ApiError> {
     app.limits.hit(Bucket::Join, ip)?;
+    app.limits.join_allowed()?;
     check_device_id(&req.device_id)?;
-    let join = app.pairing.start_join(req.code.trim(), &req.device_id)?;
+    let join = app
+        .pairing
+        .start_join(req.code.trim(), &req.device_id)
+        .inspect_err(|err| {
+            if matches!(err, ApiError::CodeInvalid) {
+                app.limits.join_failed();
+            }
+        })?;
     let request = json!({
         "type": "pairRequest",
         "session": join.session,

@@ -61,12 +61,12 @@ impl Pairing {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Issues a new 6-digit code for the group, replacing the previous one.
+    /// Issues a new 8-digit code for the group, replacing the previous one.
     pub fn create_code(&self, group: &str, inviter: &str) -> (String, DateTime<Utc>) {
         let mut inner = self.lock();
         let now = Instant::now();
         let code = loop {
-            let code = format!("{:06}", rand::thread_rng().gen_range(0..1_000_000));
+            let code = format!("{:08}", rand::thread_rng().gen_range(0..100_000_000));
             let taken = inner
                 .codes
                 .iter()

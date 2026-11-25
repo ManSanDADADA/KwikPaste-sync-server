@@ -49,6 +49,16 @@ pub struct Limits {
     pub joins_per_ip_per_hour: Option<u32>,
     pub image_quota: Option<ImageQuota>,
     pub idle_group_days: Option<i64>,
+    /// `codeInvalid` join failures, all IPs together, per rolling hour.
+    pub join_failures_per_hour: Option<u32>,
+    /// Stored body bytes per group.
+    pub group_storage: Option<u64>,
+    /// Stored body bytes over all groups.
+    pub storage: Option<u64>,
+    /// Non-image bytes forwarded live per group per day (Asia/Shanghai).
+    pub group_forward_per_day: Option<u64>,
+    /// Frames one device may upload per rolling 10 minutes.
+    pub frames_per_device_per_10min: Option<u32>,
 }
 
 /// Daily image forwarding volume, reset at 00:00 Asia/Shanghai.
@@ -99,6 +109,11 @@ impl Config {
                     global: 1024 * MIB,
                 }),
                 idle_group_days: Some(90),
+                join_failures_per_hour: Some(1000),
+                group_storage: Some(20 * MIB),
+                storage: Some(2048 * MIB),
+                group_forward_per_day: Some(200 * MIB),
+                frames_per_device_per_10min: Some(1200),
             },
         }
     }
@@ -140,7 +155,26 @@ pub fn from_env() -> Result<(Config, String, Option<TokenSource>)> {
 
     let mode = env::var("KP_SYNC_MODE").unwrap_or_else(|_| "selfhost".into());
     let (mut config, source) = match mode.as_str() {
-        "official" => (Config::official(data_dir), None),
+        "official" => {
+            let mut config = Config::official(data_dir);
+            let limits = &mut config.limits;
+            if let Some(n) = parse_env("KP_SYNC_JOIN_FAILURES_PER_HOUR")? {
+                limits.join_failures_per_hour = Some(n);
+            }
+            if let Some(mb) = parse_env::<u64>("KP_SYNC_GROUP_STORAGE_MB")? {
+                limits.group_storage = Some(mb.saturating_mul(MIB));
+            }
+            if let Some(mb) = parse_env::<u64>("KP_SYNC_STORAGE_MB")? {
+                limits.storage = Some(mb.saturating_mul(MIB));
+            }
+            if let Some(mb) = parse_env::<u64>("KP_SYNC_GROUP_FORWARD_MB_PER_DAY")? {
+                limits.group_forward_per_day = Some(mb.saturating_mul(MIB));
+            }
+            if let Some(n) = parse_env("KP_SYNC_FRAMES_PER_DEVICE_PER_10MIN")? {
+                limits.frames_per_device_per_10min = Some(n);
+            }
+            (config, None)
+        }
         "selfhost" => {
             let (token, source) = server_token(&data_dir)?;
             let mut config = Config::selfhost(data_dir, token);

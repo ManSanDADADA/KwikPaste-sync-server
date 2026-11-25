@@ -4,7 +4,7 @@
 use crate::{config, error::ApiError};
 use chrono::{DateTime, NaiveDate, NaiveTime, TimeDelta, Utc};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::IpAddr,
     sync::{Mutex, MutexGuard},
     time::{Duration, Instant},
@@ -27,6 +27,52 @@ struct State {
     day: Option<NaiveDate>,
     group_images: HashMap<String, u64>,
     global_images: u64,
+    group_forward: HashMap<String, u64>,
+    join_failures: VecDeque<Instant>,
+    device_frames: HashMap<(String, String), VecDeque<Instant>>,
+}
+
+const JOIN_FAILURE_WINDOW: Duration = Duration::from_secs(3_600);
+const FRAME_WINDOW: Duration = Duration::from_secs(600);
+
+/// Drops timestamps older than `window`.
+fn expire(times: &mut VecDeque<Instant>, now: Instant, window: Duration) {
+    while times
+        .front()
+        .is_some_and(|t| now.duration_since(*t) >= window)
+    {
+        times.pop_front();
+    }
+}
+
+/// Rolling-window check: `Err` with the wait until the oldest timestamp leaves the window.
+fn rolling_check(
+    times: &mut VecDeque<Instant>,
+    max: u32,
+    window: Duration,
+) -> Result<(), ApiError> {
+    let now = Instant::now();
+    expire(times, now, window);
+    match times.front() {
+        Some(oldest) if times.len() >= max as usize => Err(ApiError::RateLimited {
+            retry_after: (window - now.duration_since(*oldest)).as_secs().max(1),
+        }),
+        _ => Ok(()),
+    }
+}
+
+impl State {
+    /// Resets the daily counters after midnight Shanghai; returns the next reset.
+    fn roll_day(&mut self) -> DateTime<Utc> {
+        let (today, reset) = shanghai_day();
+        if self.day != Some(today) {
+            self.day = Some(today);
+            self.group_images.clear();
+            self.global_images = 0;
+            self.group_forward.clear();
+        }
+        reset
+    }
 }
 
 impl Limits {
@@ -79,12 +125,7 @@ impl Limits {
             return Ok(());
         };
         let mut state = self.lock();
-        let (today, reset) = shanghai_day();
-        if state.day != Some(today) {
-            state.day = Some(today);
-            state.group_images.clear();
-            state.global_images = 0;
-        }
+        let reset = state.roll_day();
         let group_used = state.group_images.get(group).copied().unwrap_or(0);
         if group_used + len > quota.per_group || state.global_images + len > quota.global {
             return Err(reset);
@@ -101,12 +142,76 @@ impl Limits {
         state.global_images += len;
     }
 
+    /// Whether `len` more non-image bytes fit the group's forward budget; `Err(retryAt)` when not.
+    pub fn forward_allowed(&self, group: &str, len: u64) -> Result<(), DateTime<Utc>> {
+        let Some(budget) = self.config.group_forward_per_day else {
+            return Ok(());
+        };
+        let mut state = self.lock();
+        let reset = state.roll_day();
+        let used = state.group_forward.get(group).copied().unwrap_or(0);
+        if used + len > budget {
+            return Err(reset);
+        }
+        Ok(())
+    }
+
+    pub fn charge_forward(&self, group: &str, len: u64) {
+        if self.config.group_forward_per_day.is_none() {
+            return;
+        }
+        let mut state = self.lock();
+        state.roll_day();
+        *state.group_forward.entry(group.to_owned()).or_insert(0) += len;
+    }
+
+    /// Fails while the global `codeInvalid` count of the last hour is at its limit.
+    pub fn join_allowed(&self) -> Result<(), ApiError> {
+        let Some(max) = self.config.join_failures_per_hour else {
+            return Ok(());
+        };
+        rolling_check(&mut self.lock().join_failures, max, JOIN_FAILURE_WINDOW)
+    }
+
+    pub fn join_failed(&self) {
+        if self.config.join_failures_per_hour.is_some() {
+            self.lock().join_failures.push_back(Instant::now());
+        }
+    }
+
+    /// Counts one uploaded frame from the device; fails once it is over its 10-minute rate.
+    pub fn frame(&self, group: &str, device: &str) -> Result<(), ApiError> {
+        let Some(max) = self.config.frames_per_device_per_10min else {
+            return Ok(());
+        };
+        let mut state = self.lock();
+        let times = state
+            .device_frames
+            .entry((group.to_owned(), device.to_owned()))
+            .or_default();
+        rolling_check(times, max, FRAME_WINDOW)?;
+        times.push_back(Instant::now());
+        Ok(())
+    }
+
+    /// Whether `len` more stored bytes fit the group and global caps.
+    pub fn storage_allowed(&self, group_used: u64, global_used: u64, len: u64) -> bool {
+        let fits = |used: u64, cap: Option<u64>| cap.is_none_or(|cap| used + len <= cap);
+        fits(group_used, self.config.group_storage) && fits(global_used, self.config.storage)
+    }
+
     pub fn purge(&self) {
         let now = Instant::now();
         let day = Duration::from_secs(86_400);
-        self.lock()
+        let mut state = self.lock();
+        state
             .windows
             .retain(|_, (start, _)| now.duration_since(*start) < day);
+        expire(&mut state.join_failures, now, JOIN_FAILURE_WINDOW);
+        state.device_frames.retain(|_, times| {
+            expire(times, now, FRAME_WINDOW);
+            !times.is_empty()
+        });
     }
 }
 

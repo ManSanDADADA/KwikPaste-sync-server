@@ -87,6 +87,7 @@ pub async fn upload(
         {
             return Err(ApiError::TooLarge);
         }
+        app.limits.frame(&member.group, &member.device)?;
         let header: EntryHeader = serde_json::from_slice(&head)
             .map_err(|err| ApiError::bad(format!("invalid frame header: {err}")))?;
 
@@ -164,6 +165,27 @@ async fn store(
     header: &EntryHeader,
     body: &[u8],
 ) -> Result<Value, ApiError> {
+    let len = body.len() as u64;
+    let quota = |retry_at| {
+        json!({
+            "entryId": header.entry_id,
+            "status": "rejected",
+            "error": "quota",
+            "retryAt": timestamp(retry_at),
+        })
+    };
+    let (group_used, global_used) =
+        db::stored_bytes(&app.db, &member.group, &header.entry_id).await?;
+    if !app.limits.storage_allowed(group_used, global_used, len) {
+        return Ok(quota(Utc::now() + TimeDelta::hours(1)));
+    }
+    let forwards = header.class != "image";
+    if forwards {
+        if let Err(reset) = app.limits.forward_allowed(&member.group, len) {
+            return Ok(quota(reset));
+        }
+    }
+
     let blob = if body.len() > INLINE_MAX {
         Some(app.blobs.write(body).await?)
     } else {
@@ -185,14 +207,20 @@ async fn store(
         body: blob.is_none().then_some(body),
         blob: blob.as_deref(),
         expires_at: expires_at.as_deref(),
+        size: len,
     };
 
     let lock = app.store_lock.lock().await;
     let stored = db::store_entry(&app.db, &entry).await;
     if let Ok(Stored::New { seq, .. }) = &stored {
         let frame = header.event(Some(*seq), &member.device, body);
-        app.hub
+        let delivered = app
+            .hub
             .broadcast(&member.group, &frame, &header.skip(&member.device));
+        if forwards {
+            app.limits
+                .charge_forward(&member.group, len * delivered as u64);
+        }
     }
     drop(lock);
 

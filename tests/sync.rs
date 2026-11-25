@@ -118,7 +118,8 @@ impl Server {
             .await;
         assert_eq!(status, StatusCode::OK);
         let code = code["code"].as_str().unwrap().to_owned();
-        assert_eq!(code.len(), 6);
+        assert_eq!(code.len(), 8);
+        assert!(code.bytes().all(|b| b.is_ascii_digit()));
 
         let join = self
             .request(Method::POST, "/v1/join", None)
@@ -472,7 +473,7 @@ async fn official_policy() {
     // Wrong code, then a right code while the inviter has no event stream.
     let join = |code: &str| json!({ "code": code, "deviceId": B, "spake": "x" });
     let (status, err) = s
-        .call(Method::POST, "/v1/join", None, Some(join("000000")))
+        .call(Method::POST, "/v1/join", None, Some(join("00000000")))
         .await;
     assert_eq!(
         (status, err["error"].as_str()),
@@ -594,4 +595,105 @@ async fn shutdown_closes_open_streams() {
     events.assert_ended().await;
     let result = timeout(Duration::from_secs(5), server).await;
     assert!(matches!(result, Ok(Ok(Ok(())))), "server did not stop");
+}
+
+fn text_frame(id: u32, clock: u64, body: &[u8]) -> (Value, Vec<u8>) {
+    (entry(id, "item", "text", clock, A), body.to_vec())
+}
+
+#[tokio::test]
+async fn official_group_storage_cap() {
+    let s = Server::start(|dir| {
+        let mut config = Config::official(dir);
+        config.limits.group_storage = Some(100);
+        config
+    })
+    .await;
+    let ta = s.create_group(A).await;
+
+    let results = s.upload(&ta, &[text_frame(1, 1, &[0; 60])]).await;
+    assert_eq!(results[0]["status"], "stored");
+    let results = s.upload(&ta, &[text_frame(2, 2, &[0; 60])]).await;
+    assert_eq!(
+        (results[0]["status"].as_str(), results[0]["error"].as_str()),
+        (Some("rejected"), Some("quota"))
+    );
+    let retry_at =
+        chrono::DateTime::parse_from_rfc3339(results[0]["retryAt"].as_str().unwrap()).unwrap();
+    assert!(retry_at > chrono::Utc::now());
+
+    // Replacing an entry only counts its growth.
+    let results = s.upload(&ta, &[text_frame(1, 3, &[0; 90])]).await;
+    assert_eq!(results[0]["status"], "stored");
+}
+
+#[tokio::test]
+async fn official_forward_budget() {
+    let s = Server::start(|dir| {
+        let mut config = Config::official(dir);
+        config.limits.group_forward_per_day = Some(100);
+        config
+    })
+    .await;
+    let ta = s.create_group(A).await;
+    let mut ea = s.events(&ta, "after=0").await;
+    ea.next().await;
+    let tb = s.pair(&ta, &mut ea, B).await;
+    let _eb = s.events(&tb, "after=0").await;
+
+    // B is online, so 60 bytes forwarded leaves no room for another 60.
+    let results = s.upload(&ta, &[text_frame(1, 1, &[0; 60])]).await;
+    assert_eq!(results[0]["status"], "stored");
+    let results = s.upload(&ta, &[text_frame(2, 2, &[0; 60])]).await;
+    assert_eq!(results[0]["error"], "quota");
+}
+
+#[tokio::test]
+async fn official_join_failure_limit() {
+    let s = Server::start(|dir| {
+        let mut config = Config::official(dir);
+        config.limits.join_failures_per_hour = Some(2);
+        config
+    })
+    .await;
+    let join = || json!({ "code": "00000000", "deviceId": B, "spake": "x" });
+    for _ in 0..2 {
+        let (status, err) = s.call(Method::POST, "/v1/join", None, Some(join())).await;
+        assert_eq!(
+            (status, err["error"].as_str()),
+            (StatusCode::NOT_FOUND, Some("codeInvalid"))
+        );
+    }
+    let resp = s
+        .request(Method::POST, "/v1/join", None)
+        .json(&join())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(resp.headers().contains_key("retry-after"));
+}
+
+#[tokio::test]
+async fn official_device_frame_rate() {
+    let s = Server::start(|dir| {
+        let mut config = Config::official(dir);
+        config.limits.frames_per_device_per_10min = Some(2);
+        config
+    })
+    .await;
+    let ta = s.create_group(A).await;
+
+    let results = s
+        .upload(&ta, &[text_frame(1, 1, b"a"), text_frame(2, 2, b"b")])
+        .await;
+    assert_eq!(results.len(), 2);
+    let resp = s
+        .request(Method::POST, "/v1/entries", Some(&ta))
+        .body(frame(&text_frame(3, 3, b"c").0, b"c"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(resp.headers().contains_key("retry-after"));
 }
