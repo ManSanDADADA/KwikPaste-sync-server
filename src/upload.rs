@@ -213,8 +213,31 @@ fn forward_image(app: &App, member: &Member, header: &EntryHeader, body: &[u8]) 
     json!({ "entryId": header.entry_id, "status": "forwarded" })
 }
 
+/// Sends an entry to the group's online devices and charges the forward budget (images
+/// have their own quota).
+fn forward(
+    app: &App,
+    member: &Member,
+    header: &EntryHeader,
+    body: &[u8],
+    charged: u64,
+    seq: Option<i64>,
+) {
+    let frame = header.event(seq, &member.device, body);
+    let delivered = app
+        .hub
+        .broadcast(&member.group, &frame, &header.skip(&member.device));
+    if header.class != "image" {
+        app.limits
+            .charge_forward(&member.group, charged * delivered as u64);
+    }
+    count(app, "up", header, body.len() as u64, 1);
+    count(app, "live", header, body.len() as u64, delivered as u64);
+}
+
 /// Last-writer-wins store, then forward with the new `seq`. Storage and forwarding are
-/// charged per row on top of the body, so empty entries are not free.
+/// charged per row on top of the body, so empty entries are not free. Over a storage cap
+/// the entry is only forwarded, like a live image.
 async fn store(
     app: AppState,
     member: Member,
@@ -222,19 +245,15 @@ async fn store(
     body: Vec<u8>,
 ) -> Result<Value, ApiError> {
     let charged = body.len() as u64 + ROW_OVERHEAD;
-    let quota = |retry_at| {
-        json!({
-            "entryId": header.entry_id,
-            "status": "rejected",
-            "error": "quota",
-            "retryAt": timestamp(retry_at),
-        })
-    };
-    let forwards = header.class != "image";
-    if forwards {
+    if header.class != "image" {
         if let Err(reset) = app.limits.forward_allowed(&member.group, charged) {
             app.stats.add("limit.forward", 1);
-            return Ok(quota(reset));
+            return Ok(json!({
+                "entryId": header.entry_id,
+                "status": "rejected",
+                "error": "quota",
+                "retryAt": timestamp(reset),
+            }));
         }
     }
 
@@ -279,7 +298,8 @@ async fn store(
             drop(lock);
             app.blobs.remove(blob).await;
             app.stats.add("limit.storage", 1);
-            return Ok(quota(Utc::now() + TimeDelta::hours(1)));
+            forward(&app, &member, &header, &body, charged, None);
+            return Ok(json!({ "entryId": header.entry_id, "status": "forwarded" }));
         }
     }
     let stored = db::store_entry(&app.db, &entry).await;
@@ -292,16 +312,7 @@ async fn store(
             (total + charged).saturating_sub(*replaced_size),
             Ordering::Relaxed,
         );
-        let frame = header.event(Some(*seq), &member.device, &body);
-        let delivered = app
-            .hub
-            .broadcast(&member.group, &frame, &header.skip(&member.device));
-        if forwards {
-            app.limits
-                .charge_forward(&member.group, charged * delivered as u64);
-        }
-        count(&app, "up", &header, body.len() as u64, 1);
-        count(&app, "live", &header, body.len() as u64, delivered as u64);
+        forward(&app, &member, &header, &body, charged, Some(*seq));
     }
     drop(lock);
 

@@ -701,17 +701,27 @@ async fn official_group_storage_cap() {
     })
     .await;
     let ta = s.create_group(A).await;
+    let mut ea = s.events(&ta, "after=0").await;
+    ea.next().await;
+    let tb = s.pair(&ta, &mut ea, B).await;
+    let mut eb = s.events(&tb, "after=0").await;
+    eb.next().await;
 
     let results = s.upload(&ta, &[text_frame(1, 1, &[0; 60])]).await;
     assert_eq!(results[0]["status"], "stored");
+    eb.next().await;
+    // Over the cap the entry is not stored but still reaches the devices online now.
     let results = s.upload(&ta, &[text_frame(2, 2, &[0; 60])]).await;
     assert_eq!(
-        (results[0]["status"].as_str(), results[0]["error"].as_str()),
-        (Some("rejected"), Some("quota"))
+        results,
+        vec![json!({ "entryId": format!("{:032x}", 2), "status": "forwarded" })]
     );
-    let retry_at =
-        chrono::DateTime::parse_from_rfc3339(results[0]["retryAt"].as_str().unwrap()).unwrap();
-    assert!(retry_at > chrono::Utc::now());
+    let (header, body) = eb.next().await;
+    assert_eq!(
+        (header["seq"].clone(), header["entryId"].clone()),
+        (Value::Null, json!(format!("{:032x}", 2)))
+    );
+    assert_eq!(body, vec![0; 60]);
 
     // Replacing an entry only counts its growth.
     let results = s.upload(&ta, &[text_frame(1, 3, &[0; 90])]).await;
@@ -814,7 +824,8 @@ async fn official_rejects_free_rows_and_unexpected_entries() {
             .collect()
     };
 
-    // Empty settings rows still cost 512 bytes each against the persistent cap.
+    // Empty settings rows still cost 512 bytes each against the persistent cap; past it
+    // they are only forwarded.
     let results = s
         .upload(
             &ta,
@@ -825,7 +836,7 @@ async fn official_rejects_free_rows_and_unexpected_entries() {
             ],
         )
         .await;
-    assert_eq!(outcome(&results), ["stored", "stored", "quota"]);
+    assert_eq!(outcome(&results), ["stored", "stored", "forwarded"]);
 
     // A malformed header, a wrong id shape, a kind the client never sends to the official
     // server and oversized settings are each rejected; the rest of the request goes on.

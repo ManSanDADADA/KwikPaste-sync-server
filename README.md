@@ -123,7 +123,7 @@ server {
 官方模式只做立即同步：文本留 24 小时，图片只实时转发不存储（单张 ≤ 2 MiB，每组每天 30 MiB、全站每天 1 GiB，北京时间零点重置），
 不同步收藏等元数据，每组 10 台设备，每 IP 每天建组 10 次、每小时加入 30 次，90 天没有设备连接的组整组删除。
 配对码是 8 位数字，全站每小时最多 1000 次配对码错误，超过后所有加入请求暂停到最早一次错误滑出一小时窗口。
-每组最多存 20 MiB、全站最多存 2 GiB，每组每天实时转发 200 MiB 非图片条目，每台设备每 10 分钟最多上传 1200 条；存储与转发超限的条目单条返回 `quota` 和 `retryAt`，上传频率超限整个请求返回 429。以上数值都可用上面的环境变量调整。
+每组最多存 20 MiB、全站最多存 2 GiB，每组每天实时转发 200 MiB 非图片条目，每台设备每 10 分钟最多上传 1200 条；存储超限的条目不再存储，只转发给在线设备；转发超限的条目单条返回 `quota` 和 `retryAt`；上传频率超限整个请求返回 429。以上数值都可用上面的环境变量调整。
 另外固定：每条按密文加 512 字节计入存储和转发；只收文本、图片和设置三种条目，单条设置 ≤ 64 KiB，每组永久保留的条目（设置）合计 ≤ 1 MiB；
 不读数据的事件流积压超过 4 MiB 就断开；nginx 限每个 IP 最多 16 个并发连接。
 
@@ -133,8 +133,8 @@ server {
 1. 本机拉镜像再传过去（那台机器拉不了 Docker Hub，从 ghcr.io 下载也几乎不动）：
 
    ```bash
-   docker pull --platform linux/amd64 ghcr.io/mansandadada/kwikpaste-sync-server:1.3.0
-   docker save --platform linux/amd64 ghcr.io/mansandadada/kwikpaste-sync-server:1.3.0 | gzip > kps.tar.gz
+   docker pull --platform linux/amd64 ghcr.io/mansandadada/kwikpaste-sync-server:1.3.1
+   docker save --platform linux/amd64 ghcr.io/mansandadada/kwikpaste-sync-server:1.3.1 | gzip > kps.tar.gz
    scp kps.tar.gz root@<服务器>:/tmp/ && ssh root@<服务器> 'gunzip -c /tmp/kps.tar.gz | docker load'
    ```
 
@@ -170,7 +170,7 @@ server {
      --memory 256m --cpus 1 --log-opt max-size=10m --log-opt max-file=3 \
      --network kwikpaste-sync-net --ip 172.31.255.10 -v /home/kwikpaste-sync:/data \
      -e KP_SYNC_MODE=official -e KP_SYNC_TRUST_PROXY=1 \
-     ghcr.io/mansandadada/kwikpaste-sync-server:1.3.0
+     ghcr.io/mansandadada/kwikpaste-sync-server:1.3.1
    ```
 
    统计令牌放在只有 root 能读的环境文件里，再给上面的 `docker run` 加 `--env-file /etc/kwikpaste-sync.env`：
@@ -179,7 +179,7 @@ server {
    umask 077 && echo "KP_SYNC_STATS_TOKEN=$(openssl rand -hex 32)" > /etc/kwikpaste-sync.env
    ```
 
-   升级：按第 1 步传入新版本后 `docker rm -f kwikpaste-sync`，再用同样的参数 `docker run`（数据在卷里，不受影响；
+   升级：按第 1 步传入新版本后 `docker stop -t 70 kwikpaste-sync && docker rm kwikpaste-sync`（留时间做最后一次统计落盘），再用同样的参数 `docker run`（数据在卷里，不受影响；
    表结构有变化时要写迁移）。nginx 容器如果被重建，要重新 `docker network connect kwikpaste-sync-net nginx`。
 
 4. nginx：[`deploy/nginx-official.conf`](deploy/nginx-official.conf) 放进 nginx 的 `conf.d/`，证书用 acme.sh（webroot）单独签发：
