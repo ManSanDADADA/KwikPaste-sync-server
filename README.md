@@ -133,8 +133,8 @@ server {
 1. 本机拉镜像再传过去（那台机器拉不了 Docker Hub，从 ghcr.io 下载也几乎不动）：
 
    ```bash
-   docker pull --platform linux/amd64 ghcr.io/mansandadada/kwikpaste-sync-server:1.3.1
-   docker save --platform linux/amd64 ghcr.io/mansandadada/kwikpaste-sync-server:1.3.1 | gzip > kps.tar.gz
+   docker pull --platform linux/amd64 ghcr.io/mansandadada/kwikpaste-sync-server:1.3.2
+   docker save --platform linux/amd64 ghcr.io/mansandadada/kwikpaste-sync-server:1.3.2 | gzip > kps.tar.gz
    scp kps.tar.gz root@<服务器>:/tmp/ && ssh root@<服务器> 'gunzip -c /tmp/kps.tar.gz | docker load'
    ```
 
@@ -170,7 +170,7 @@ server {
      --memory 256m --cpus 1 --log-opt max-size=10m --log-opt max-file=3 \
      --network kwikpaste-sync-net --ip 172.31.255.10 -v /home/kwikpaste-sync:/data \
      -e KP_SYNC_MODE=official -e KP_SYNC_TRUST_PROXY=1 \
-     ghcr.io/mansandadada/kwikpaste-sync-server:1.3.1
+     ghcr.io/mansandadada/kwikpaste-sync-server:1.3.2
    ```
 
    统计令牌放在只有 root 能读的环境文件里，再给上面的 `docker run` 加 `--env-file /etc/kwikpaste-sync.env`：

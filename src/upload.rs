@@ -207,7 +207,8 @@ fn forward_image(app: &App, member: &Member, header: &EntryHeader, body: &[u8]) 
     count(app, "live", header, len, delivered as u64);
     if delivered > 0 {
         app.limits.charge_image(&member.group, len);
-    } else {
+    } else if header.skip.is_empty() {
+        // Devices in `skip` already got it over LAN.
         app.stats.add("image.undelivered", 1);
     }
     json!({ "entryId": header.entry_id, "status": "forwarded" })
